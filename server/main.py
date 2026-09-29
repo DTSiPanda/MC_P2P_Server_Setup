@@ -40,6 +40,47 @@ def root():
     return {"status": "ok", "service": "Minecraft P2P API", "version": "0.3.0"}
 
 
+@app.on_event("startup")
+async def _startup_restore_state():
+    """
+    On startup, scan R2 for existing world zips and restore _world_versions.
+    This ensures a server restart (e.g. Render cold-start) does not make the
+    server forget about the current cloud world.
+    """
+    try:
+        import server.r2 as r2
+        client = r2.get_client()
+        paginator = client.get_paginator("list_objects_v2")
+        keys: list[tuple[str, float]] = []
+        for page in paginator.paginate(Bucket=r2.BUCKET, Prefix="worlds/"):
+            for obj in page.get("Contents", []):
+                ts = obj.get("LastModified")
+                keys.append((obj["Key"], ts.timestamp() if ts else 0.0))
+
+        if keys:
+            keys.sort(key=lambda x: x[1])  # oldest first
+            for key, created_at in keys:
+                _world_versions.append(
+                    WorldVersion(
+                        key=key,
+                        sha256="restored",
+                        size=0,
+                        created_by="server-restore",
+                        created_at=created_at,
+                        is_current=False,
+                    )
+                )
+            _world_versions[-1].is_current = True
+            logger.info(
+                f"[startup] Restored {len(_world_versions)} world version(s) from R2. "
+                f"Current: {_world_versions[-1].key}"
+            )
+        else:
+            logger.info("[startup] No existing world versions found in R2. Starting fresh.")
+    except Exception as exc:
+        logger.warning(f"[startup] Could not restore world state from R2: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # In-memory state & Data Models
 # ---------------------------------------------------------------------------
@@ -487,6 +528,23 @@ def get_host(player: str = Depends(_get_player)):
         port=_host.port,
         since=_host.updated_at,
     )
+
+
+@app.get("/lock/status")
+def get_lock_status(player: str = Depends(_get_player)):
+    """Return current lock holder, expiry, and host info in one call."""
+    now = time.time()
+    lock_held = _lock.holder_name is not None and not _lock_is_expired()
+    current = _current_version()
+    return {
+        "lock_held": lock_held,
+        "holder_name": _lock.holder_name if lock_held else None,
+        "expires_at": _lock.expires_at if lock_held else None,
+        "seconds_remaining": max(0.0, _lock.expires_at - now) if lock_held else 0.0,
+        "hosting": _host.ip is not None and lock_held,
+        "host_name": _host.host_name if (_host.ip and lock_held) else None,
+        "current_world_version": current.key if current else None,
+    }
 
 
 @app.get("/config", response_model=ConfigResponse)

@@ -248,10 +248,59 @@ class AppUI(tk.Tk):
                     text="Invite created! Checking Tailscale acceptance..."
                 )
 
-                # Prompt user with invite URL if available
+                # Show the Tailscale invite URL prominently — don't just silently open browser
                 if invite_url:
                     import webbrowser
-                    webbrowser.open(invite_url)
+                    # Try opening browser automatically (may not work on all setups)
+                    try:
+                        webbrowser.open(invite_url)
+                    except Exception:
+                        pass
+
+                    # Always show the link in a visible dialog so it can't be missed
+                    def show_invite_dialog():
+                        dlg = tk.Toplevel(self)
+                        dlg.title("Step 2 – Join Tailscale Network")
+                        dlg.geometry("520x220")
+                        dlg.configure(background="#1e1e24")
+                        dlg.grab_set()
+
+                        ttk.Label(
+                            dlg,
+                            text="📧 Check your email OR click the link below:",
+                            style="Header.TLabel",
+                        ).pack(pady=(16, 6), padx=16)
+
+                        ttk.Label(
+                            dlg,
+                            text="A browser tab should have opened. If not, copy this link and open it manually:",
+                            style="TLabel",
+                            wraplength=480,
+                        ).pack(padx=16)
+
+                        # Clickable / copyable URL entry
+                        url_var = tk.StringVar(value=invite_url)
+                        entry_url = ttk.Entry(dlg, textvariable=url_var, font=("Segoe UI", 8), width=60)
+                        entry_url.pack(padx=16, pady=(8, 4))
+                        entry_url.configure(state="readonly")
+
+                        f_btns = ttk.Frame(dlg)
+                        f_btns.pack(pady=8)
+
+                        def copy_link():
+                            self.clipboard_clear()
+                            self.clipboard_append(invite_url)
+                            btn_copy.configure(text="✅ Copied!")
+
+                        def open_link():
+                            webbrowser.open(invite_url)
+
+                        btn_copy = ttk.Button(f_btns, text="📋 Copy Link", style="Primary.TButton", command=copy_link)
+                        btn_copy.pack(side=tk.LEFT, padx=6)
+                        ttk.Button(f_btns, text="🌐 Open in Browser", command=open_link).pack(side=tk.LEFT, padx=6)
+                        ttk.Button(f_btns, text="Done", command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
+                    self.after(0, show_invite_dialog)
 
                 # Poll status in background
                 accepted = poll_join_status(self.api_url, token, timeout=120, poll_interval=3, log=self.log)
@@ -292,7 +341,7 @@ class AppUI(tk.Tk):
         btn_logout = ttk.Button(f_top, text="Log Out", width=10, command=self._on_logout)
         btn_logout.pack(side=tk.RIGHT, padx=4)
 
-        # Status Bar
+        # Status Bar — Tailscale row
         f_status = ttk.Frame(self.frame_main)
         f_status.pack(fill=tk.X, pady=4)
 
@@ -312,21 +361,96 @@ class AppUI(tk.Tk):
 
         btn_ts_login = ttk.Button(f_status, text="🔌 Connect Tailscale", command=do_ts_connect)
 
+        def copy_my_ts_ip():
+            ip = get_tailscale_ip()
+            if ip:
+                self.clipboard_clear()
+                self.clipboard_append(ip)
+                self.log(f"[app] Tailscale IP copied: {ip}")
+                messagebox.showinfo("Copied", f"Your Tailscale IP copied:\n{ip}\nShare this with friends if needed.")
+            else:
+                messagebox.showwarning("Not Connected", "Tailscale is not connected. No IP to copy.")
+
+        btn_copy_ts_ip = ttk.Button(f_status, text="📋 Copy My TS IP", command=copy_my_ts_ip)
+
         def update_tailscale_display():
             try:
                 ip = get_tailscale_ip()
                 if ip:
                     self.lbl_ts_status.configure(text=f"Tailscale IP: {ip}", foreground="#06d6a0")
                     btn_ts_login.pack_forget()
+                    btn_copy_ts_ip.pack(side=tk.LEFT, padx=4)
                 else:
                     self.lbl_ts_status.configure(text="Tailscale: Not detected", foreground="#ffb703")
                     btn_ts_login.pack(side=tk.LEFT, padx=8)
+                    btn_copy_ts_ip.pack_forget()
             except Exception:
                 pass
             if self.frame_main.winfo_ismapped():
                 self.after(3000, update_tailscale_display)
 
         update_tailscale_display()
+
+        # Live Host Status Banner — polls /lock/status every 30s
+        f_host_banner = ttk.Frame(self.frame_main)
+        f_host_banner.pack(fill=tk.X, pady=(2, 4))
+
+        self.lbl_host_banner = ttk.Label(
+            f_host_banner,
+            text="⏳ Checking who's hosting...",
+            font=("Segoe UI", 9, "italic"),
+            foreground="#a0a0b0",
+            background="#1e1e24",
+        )
+        self.lbl_host_banner.pack(side=tk.LEFT)
+
+        self.lbl_world_version = ttk.Label(
+            f_host_banner,
+            text="",
+            font=("Segoe UI", 8),
+            foreground="#606070",
+            background="#1e1e24",
+        )
+        self.lbl_world_version.pack(side=tk.RIGHT)
+
+        def _poll_host_status():
+            token = get_api_token()
+            if not token:
+                return
+            try:
+                import requests as _req
+                r = _req.get(
+                    f"{self.api_url}/lock/status",
+                    headers={"x-api-token": token},
+                    timeout=6,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    hosting = data.get("hosting", False)
+                    lock_held = data.get("lock_held", False)
+                    host_name = data.get("host_name") or data.get("holder_name")
+                    world_ver = data.get("current_world_version")
+
+                    if hosting and host_name:
+                        banner_text = f"🟢 {host_name} is hosting — click Join World to connect"
+                        banner_color = "#06d6a0"
+                    elif lock_held and host_name:
+                        banner_text = f"🔵 {host_name} is setting up the host..."
+                        banner_color = "#4cc9f0"
+                    else:
+                        banner_text = "🔴 Nobody is hosting right now"
+                        banner_color = "#ffb703"
+
+                    ver_text = f"Cloud: {world_ver[:16]}…" if world_ver else "Cloud: No world yet"
+                    self.after(0, lambda: self.lbl_host_banner.configure(text=banner_text, foreground=banner_color))
+                    self.after(0, lambda: self.lbl_world_version.configure(text=ver_text))
+            except Exception:
+                pass
+            if self.frame_main.winfo_ismapped():
+                self.after(30000, _poll_host_status)
+
+        # First poll after 1s, then every 30s
+        self.after(1000, _poll_host_status)
 
         # World Selection Row
         f_world = ttk.Frame(self.frame_main)
@@ -425,8 +549,30 @@ class AppUI(tk.Tk):
         )
         self.btn_copy_addr.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
 
-        # Log Window
-        ttk.Label(self.frame_main, text="Session Logs:", style="Header.TLabel").pack(anchor=tk.W, pady=(8, 2))
+        # Log Window — header row with export button
+        f_log_header = ttk.Frame(self.frame_main)
+        f_log_header.pack(fill=tk.X, pady=(8, 2))
+        ttk.Label(f_log_header, text="Session Logs:", style="Header.TLabel").pack(side=tk.LEFT)
+
+        def export_log():
+            content = self.log_text.get("1.0", tk.END).strip()
+            if not content:
+                messagebox.showinfo("Export Log", "No log content to export.")
+                return
+            save_path = filedialog.asksaveasfilename(
+                title="Save Session Log",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                initialfile=f"mc_p2p_log_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+            )
+            if save_path:
+                try:
+                    Path(save_path).write_text(content, encoding="utf-8")
+                    messagebox.showinfo("Exported", f"Log saved to:\n{save_path}")
+                except Exception as exc:
+                    messagebox.showerror("Export Error", str(exc))
+
+        ttk.Button(f_log_header, text="💾 Export Log", command=export_log).pack(side=tk.RIGHT)
 
         self.log_text = ScrolledText(
             self.frame_main,
@@ -545,6 +691,61 @@ class AppUI(tk.Tk):
 
         def worker():
             try:
+                import requests as _req
+                # Quick pre-check: is anyone hosting?
+                r = _req.get(
+                    f"{self.api_url}/lock/status",
+                    headers={"x-api-token": token},
+                    timeout=6,
+                )
+                if r.status_code == 200 and not r.json().get("hosting"):
+                    host_name = r.json().get("holder_name")
+                    if host_name:
+                        self.log(f"[guest] {host_name} is setting up — waiting for LAN to open...")
+                    else:
+                        self.log("[guest] Nobody is hosting right now.")
+
+                    # Ask if they want to auto-wait
+                    auto_wait = threading.Event()
+                    cancel = threading.Event()
+
+                    def ask_auto_wait():
+                        ans = messagebox.askyesno(
+                            "Nobody Hosting Yet",
+                            "Nobody is hosting a game right now.\n\n"
+                            "Do you want to auto-check every 30 seconds until someone starts hosting?\n"
+                            "(You can close this app to cancel.)",
+                        )
+                        if ans:
+                            auto_wait.set()
+                        else:
+                            cancel.set()
+                        auto_wait.set()  # unblock either way
+
+                    self.after(0, ask_auto_wait)
+                    auto_wait.wait()
+
+                    if cancel.is_set():
+                        return
+
+                    # Keep polling until hosting starts
+                    while True:
+                        time.sleep(30)
+                        try:
+                            r2 = _req.get(
+                                f"{self.api_url}/lock/status",
+                                headers={"x-api-token": token},
+                                timeout=6,
+                            )
+                            if r2.status_code == 200 and r2.json().get("hosting"):
+                                hname = r2.json().get("host_name", "Someone")
+                                self.log(f"[guest] {hname} started hosting! Connecting...")
+                                break
+                            else:
+                                self.log("[guest] Still no host... checking again in 30s.")
+                        except Exception:
+                            pass
+
                 cmd_join(self.api_url, token, log=self.log)
             except Exception as exc:
                 self.log(f"[guest] Error: {exc}")
@@ -553,6 +754,8 @@ class AppUI(tk.Tk):
                 self.after(0, lambda: self.lbl_hub_status.configure(text="Status: Ready", foreground="#06d6a0"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+
 
     def _on_click_copy_address(self):
         token = get_api_token()
@@ -603,6 +806,49 @@ class AppUI(tk.Tk):
 
         lbl = ttk.Label(admin_win, text="Admin Control Panel", style="Title.TLabel")
         lbl.pack(pady=(12, 4))
+
+        # -------------------------------------------------------------
+        # Lock Status — always visible at the top of admin panel
+        # -------------------------------------------------------------
+        lf_lock = ttk.LabelFrame(admin_win, text=" 🔒 Current Lock Status ")
+        lf_lock.pack(fill=tk.X, padx=16, pady=(4, 6))
+
+        lbl_lock_status = ttk.Label(lf_lock, text="Checking...", font=("Segoe UI", 9), foreground="#a0a0b0")
+        lbl_lock_status.pack(anchor=tk.W, padx=8, pady=(4, 2))
+
+        lbl_lock_world = ttk.Label(lf_lock, text="", font=("Segoe UI", 8), foreground="#606070")
+        lbl_lock_world.pack(anchor=tk.W, padx=8, pady=(0, 4))
+
+        def refresh_lock_status():
+            try:
+                import requests as _req
+                r = _req.get(
+                    f"{self.api_url}/lock/status",
+                    headers={"x-api-token": token},
+                    timeout=6,
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    held = d.get("lock_held", False)
+                    holder = d.get("holder_name") or "—"
+                    secs = int(d.get("seconds_remaining", 0))
+                    hosting = d.get("hosting", False)
+                    world = d.get("current_world_version")
+
+                    if held:
+                        status_txt = f"🔐 Held by: {holder}   ({secs}s remaining)"
+                        status_txt += "   🟢 Hosting" if hosting else "   🔵 Acquiring..."
+                        lbl_lock_status.configure(text=status_txt, foreground="#f72585")
+                    else:
+                        lbl_lock_status.configure(text="✅ No lock held — server is free", foreground="#06d6a0")
+
+                    world_txt = f"Current world: {world}" if world else "Current world: None (no uploads yet)"
+                    lbl_lock_world.configure(text=world_txt)
+            except Exception as exc:
+                lbl_lock_status.configure(text=f"Could not fetch lock status: {exc}", foreground="#ffb703")
+
+        ttk.Button(lf_lock, text="🔄 Refresh", command=refresh_lock_status).pack(anchor=tk.E, padx=8, pady=(0, 4))
+        refresh_lock_status()
 
         # -------------------------------------------------------------
         # Section 1: Cloud World Management

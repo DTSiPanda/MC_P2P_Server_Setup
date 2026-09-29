@@ -29,6 +29,7 @@ a = Analysis(
         'client.heartbeat',
         'client.host_session',
         'client.lan_sniffer',
+        'client.modpack_manager',
         'client.world_sync',
     ],
     hookspath=[],

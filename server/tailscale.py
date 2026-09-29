@@ -1,5 +1,5 @@
 """
-Tailscale API client using OAuth client credentials.
+Tailscale API client supporting both Personal API Access Tokens and OAuth clients.
 
 All credentials stay on the server (never exposed to clients).
 Supports:
@@ -18,6 +18,7 @@ from typing import Any, Optional
 import requests
 
 TAILSCALE_API_BASE = os.getenv("TAILSCALE_API_BASE", "https://api.tailscale.com")
+TAILSCALE_API_KEY = os.getenv("TAILSCALE_API_KEY", "")
 TAILSCALE_CLIENT_ID = os.getenv("TAILSCALE_CLIENT_ID", "")
 TAILSCALE_CLIENT_SECRET = os.getenv("TAILSCALE_CLIENT_SECRET", "")
 TAILSCALE_TAILNET = os.getenv("TAILSCALE_TAILNET", "-")  # '-' represents default tailnet in API
@@ -29,11 +30,13 @@ _client: Optional[TailscaleClient] = None
 class TailscaleClient:
     def __init__(
         self,
+        api_key: str = TAILSCALE_API_KEY,
         client_id: str = TAILSCALE_CLIENT_ID,
         client_secret: str = TAILSCALE_CLIENT_SECRET,
         tailnet: str = TAILSCALE_TAILNET,
         api_base: str = TAILSCALE_API_BASE,
     ):
+        self.api_key = api_key
         self.client_id = client_id
         self.client_secret = client_secret
         self.tailnet = tailnet
@@ -43,10 +46,13 @@ class TailscaleClient:
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.client_id and self.client_secret)
+        return bool(self.api_key or (self.client_id and self.client_secret))
 
     def _get_access_token(self) -> str:
-        """Obtain or refresh OAuth access token using client credentials."""
+        """Obtain or refresh OAuth access token if using OAuth client credentials."""
+        if self.api_key:
+            return self.api_key
+
         now = time.time()
         if self._access_token and now < self._token_expires_at - 60:
             return self._access_token
@@ -78,7 +84,7 @@ class TailscaleClient:
         Returns: { "id": "...", "inviteUrl": "https://...", "email": email }
         """
         if not self.is_configured:
-            # Fallback stub for dev / mock mode when no OAuth keys are configured
+            # Fallback stub for dev / mock mode when no keys are configured
             return {
                 "id": f"mock-invite-{int(time.time())}",
                 "inviteUrl": f"https://login.tailscale.com/admin/invite/mock-{email}",

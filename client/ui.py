@@ -23,9 +23,11 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Optional
+
+from client.modpack_manager import get_all_world_directories
 
 from client.admin import AdminClient, get_admin_secret, save_admin_secret
 from client.api_client import APIClient, APIError, check_compatibility
@@ -307,28 +309,46 @@ class AppUI(tk.Tk):
 
         ttk.Label(f_world, text="World to Sync:").pack(side=tk.LEFT, padx=(0, 6))
 
-        saves_dir = self.world_dir.parent if self.world_dir.parent.exists() else (_APPDATA / ".minecraft" / "saves")
-        detected_worlds = [d.name for d in saves_dir.iterdir() if d.is_dir()] if saves_dir.exists() else []
-        if not detected_worlds:
-            detected_worlds = ["OurWorld"]
-        if "Frends" in detected_worlds and "OurWorld" not in detected_worlds:
-            self.world_dir = saves_dir / "Frends"
+        self.world_map = get_all_world_directories()
+        display_labels = list(self.world_map.keys()) if self.world_map else ["OurWorld [Standard]"]
 
-        self.combo_worlds = ttk.Combobox(f_world, values=detected_worlds, font=("Segoe UI", 9), width=20)
-        default_val = self.world_dir.name if self.world_dir.name in detected_worlds else detected_worlds[0]
-        self.combo_worlds.set(default_val)
+        # Default selection priority: OurWorld if exists, else first
+        default_label = display_labels[0]
+        for lbl in display_labels:
+            if "OurWorld" in lbl:
+                default_label = lbl
+                break
+
+        self.world_dir = self.world_map.get(default_label, DEFAULT_WORLD_DIR)
+
+        self.combo_worlds = ttk.Combobox(f_world, values=display_labels, font=("Segoe UI", 9), width=28)
+        self.combo_worlds.set(default_label)
         self.combo_worlds.pack(side=tk.LEFT, padx=4)
 
         def on_world_change(event=None):
             sel = self.combo_worlds.get().strip()
-            if sel:
-                self.world_dir = saves_dir / sel
+            if sel in self.world_map:
+                self.world_dir = self.world_map[sel]
                 self.log(f"[app] Selected world: {self.world_dir}")
 
         self.combo_worlds.bind("<<ComboboxSelected>>", on_world_change)
 
+        def on_browse_world():
+            chosen = filedialog.askdirectory(title="Select Minecraft World Folder (containing level.dat)")
+            if chosen:
+                p = Path(chosen)
+                lbl = f"{p.name} [Custom: {p.parent.name}]"
+                self.world_map[lbl] = p
+                self.combo_worlds["values"] = list(self.world_map.keys())
+                self.combo_worlds.set(lbl)
+                self.world_dir = p
+                self.log(f"[app] Custom world chosen: {self.world_dir}")
+
+        btn_browse = ttk.Button(f_world, text="📁 Browse...", width=10, command=on_browse_world)
+        btn_browse.pack(side=tk.LEFT, padx=4)
+
         btn_manual_upload = ttk.Button(f_world, text="☁ Upload to Cloud", command=self._on_click_manual_upload)
-        btn_manual_upload.pack(side=tk.LEFT, padx=6)
+        btn_manual_upload.pack(side=tk.LEFT, padx=4)
 
         # Action Buttons
         f_actions = ttk.Frame(self.frame_main)
@@ -524,32 +544,43 @@ class AppUI(tk.Tk):
 
         ttk.Label(f_pick, text="Select Local World:").pack(side=tk.LEFT, padx=(0, 6))
 
-        saves_dir = self.world_dir.parent if self.world_dir.parent.exists() else (_APPDATA / ".minecraft" / "saves")
-        local_saves = [d.name for d in saves_dir.iterdir() if d.is_dir()] if saves_dir.exists() else ["OurWorld"]
-        combo_admin_world = ttk.Combobox(f_pick, values=local_saves, width=18, font=("Segoe UI", 9))
-        combo_admin_world.set(self.world_dir.name if self.world_dir.name in local_saves else local_saves[0])
+        admin_world_map = get_all_world_directories()
+        admin_labels = list(admin_world_map.keys()) if admin_world_map else ["OurWorld"]
+        combo_admin_world = ttk.Combobox(f_pick, values=admin_labels, width=28, font=("Segoe UI", 9))
+        combo_admin_world.set(self.combo_worlds.get() if self.combo_worlds.get() in admin_labels else admin_labels[0])
         combo_admin_world.pack(side=tk.LEFT, padx=4)
 
+        def on_admin_browse():
+            chosen = filedialog.askdirectory(title="Select Minecraft World Folder (containing level.dat)", parent=admin_win)
+            if chosen:
+                p = Path(chosen)
+                lbl = f"{p.name} [Custom: {p.parent.name}]"
+                admin_world_map[lbl] = p
+                combo_admin_world["values"] = list(admin_world_map.keys())
+                combo_admin_world.set(lbl)
+
+        ttk.Button(f_pick, text="📁 Browse...", width=9, command=on_admin_browse).pack(side=tk.LEFT, padx=2)
+
         def do_set_world():
-            target_name = combo_admin_world.get().strip()
-            target_path = saves_dir / target_name
-            if not target_path.exists():
+            sel_lbl = combo_admin_world.get().strip()
+            target_path = admin_world_map.get(sel_lbl)
+            if not target_path or not target_path.exists():
                 messagebox.showerror("Error", f"World folder does not exist:\n{target_path}", parent=admin_win)
                 return
 
-            if messagebox.askyesno("Confirm Set World", f"Upload '{target_name}' and make it the active cloud world for all players?", parent=admin_win):
+            if messagebox.askyesno("Confirm Set World", f"Upload '{sel_lbl}' and make it the active cloud world for all players?", parent=admin_win):
                 try:
                     from client.world_sync import cmd_upload
-                    self.log(f"[admin] Uploading '{target_name}' as active cloud world...")
+                    self.log(f"[admin] Uploading '{target_path.name}' as active cloud world...")
                     cmd_upload(self.api_url, token, target_path)
                     self.world_dir = target_path
-                    self.combo_worlds.set(target_name)
-                    messagebox.showinfo("Success", f"World '{target_name}' is now the active cloud world!", parent=admin_win)
+                    self.combo_worlds.set(sel_lbl)
+                    messagebox.showinfo("Success", f"World '{target_path.name}' is now the active cloud world!", parent=admin_win)
                     refresh_world_status()
                 except Exception as e:
                     messagebox.showerror("Upload Error", str(e), parent=admin_win)
 
-        ttk.Button(f_pick, text="📤 Set as Active World", style="Primary.TButton", command=do_set_world).pack(side=tk.LEFT, padx=6)
+        ttk.Button(f_pick, text="📤 Set as Active World", style="Primary.TButton", command=do_set_world).pack(side=tk.LEFT, padx=4)
 
         def do_reset_world():
             if messagebox.askyesno(

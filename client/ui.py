@@ -646,6 +646,12 @@ class AppUI(tk.Tk):
             if messagebox.askyesno("Confirm Set World", f"Upload '{sel_lbl}' and make it the active cloud world for all players?", parent=admin_win):
                 try:
                     from client.world_sync import cmd_upload
+                    # Force-release any stale lock before uploading so admin is never blocked
+                    try:
+                        admin_client.force_release_lock()
+                        self.log("[admin] Force-released any stale lock before upload.")
+                    except Exception:
+                        pass  # No lock held or already clear — that's fine
                     self.log(f"[admin] Uploading '{target_path.name}' as active cloud world...")
                     cmd_upload(self.api_url, token, target_path)
                     self.world_dir = target_path
@@ -656,6 +662,54 @@ class AppUI(tk.Tk):
                     messagebox.showerror("Upload Error", str(e), parent=admin_win)
 
         ttk.Button(f_pick, text="📤 Set as Active World", style="Primary.TButton", command=do_set_world).pack(side=tk.LEFT, padx=4)
+
+        # Lock override and cloud wipe buttons in a row
+        f_lock_btns = ttk.Frame(lf_world)
+        f_lock_btns.pack(fill=tk.X, padx=8, pady=(4, 2))
+
+        def do_force_release_lock():
+            if messagebox.askyesno(
+                "Force Release Lock",
+                "This will forcefully release the lock, even if someone is currently hosting.\n\n"
+                "Use this when a player's lock is stuck and blocking others.\n"
+                "The current host session (if any) will be disconnected.",
+                parent=admin_win,
+            ):
+                try:
+                    res = admin_client.force_release_lock()
+                    prev = res.get("previous_holder") or "nobody"
+                    self.log(f"[admin] Force-released lock. Previous holder: {prev}")
+                    messagebox.showinfo("Lock Released", f"Lock force-released.\nPrevious holder: {prev}", parent=admin_win)
+                    refresh_world_status()
+                except Exception as e:
+                    messagebox.showerror("Error", str(e), parent=admin_win)
+
+        def do_cloud_clear():
+            if messagebox.askyesno(
+                "⚠️ Clear ALL Cloud Data",
+                "This will DELETE ALL cloud world data from R2 storage and reset the lock.\n\n"
+                "• All cloud world backups will be permanently deleted.\n"
+                "• Any held lock will be force-released.\n"
+                "• Your local saves on this PC will NOT be deleted.\n\n"
+                "Are you sure you want to completely wipe the cloud?",
+                parent=admin_win,
+            ):
+                try:
+                    res = admin_client.cloud_clear()
+                    prev = res.get("previous_lock_holder") or "nobody"
+                    self.log(f"[admin] Cloud fully cleared. Previous lock holder: {prev}")
+                    messagebox.showinfo(
+                        "Cloud Cleared",
+                        "All cloud world data has been deleted.\n"
+                        "Upload a new world to start fresh.",
+                        parent=admin_win,
+                    )
+                    refresh_world_status()
+                except Exception as e:
+                    messagebox.showerror("Clear Error", str(e), parent=admin_win)
+
+        ttk.Button(f_lock_btns, text="🔓 Force Release Lock", style="Accent.TButton", command=do_force_release_lock).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(f_lock_btns, text="🧹 Clear Cloud Entirely", style="Danger.TButton", command=do_cloud_clear).pack(side=tk.LEFT)
 
         def do_reset_world():
             if messagebox.askyesno(
@@ -674,6 +728,7 @@ class AppUI(tk.Tk):
                     messagebox.showerror("Reset Error", str(e), parent=admin_win)
 
         ttk.Button(lf_world, text="🗑️ Delete / Reset Cloud World", style="Danger.TButton", command=do_reset_world).pack(anchor=tk.E, padx=8, pady=(4, 8))
+
 
         def refresh_world_status():
             try:

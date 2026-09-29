@@ -746,3 +746,69 @@ def admin_reset_world(admin: PlayerRecord = Depends(_verify_admin)):
     logger.info(f"Admin '{admin.name}' wiped and reset all cloud worlds")
 
     return {"reset": True, "current_world_version": None}
+
+
+@app.post("/admin/cloud/clear")
+def admin_cloud_clear(admin: PlayerRecord = Depends(_verify_admin)):
+    """
+    Admin only: fully wipe all cloud world data from R2 and in-memory state.
+    Also force-releases any held lock and clears host address.
+    Use this to start fresh when the cloud world is in a bad state.
+    """
+    import server.r2 as r2
+
+    r2.delete_all_worlds()
+    _world_versions.clear()
+    _pending_uploads.clear()
+
+    prev_holder = _lock.holder_name
+    _lock.holder_name = None
+    _lock.owner_token_hash = None
+    _lock.expires_at = 0.0
+
+    _host.ip = None
+    _host.port = None
+    _host.host_name = None
+    _host.updated_at = None
+
+    logger.info(
+        f"Admin '{admin.name}' cleared all cloud worlds. "
+        f"Previous lock holder: {prev_holder or 'none'}"
+    )
+
+    return {
+        "cleared": True,
+        "previous_lock_holder": prev_holder,
+        "current_world_version": None,
+    }
+
+
+@app.post("/admin/lock/force-release")
+def admin_force_release_lock(admin: PlayerRecord = Depends(_verify_admin)):
+    """
+    Admin only: forcefully release the lock regardless of who holds it.
+    Use this when a player's lock is stuck/stale and blocking others from hosting.
+    Also clears the host address so guests see no active host.
+    """
+    prev_holder = _lock.holder_name
+    prev_expires = _lock.expires_at
+
+    _lock.holder_name = None
+    _lock.owner_token_hash = None
+    _lock.expires_at = 0.0
+
+    _host.ip = None
+    _host.port = None
+    _host.host_name = None
+    _host.updated_at = None
+
+    logger.info(
+        f"Admin '{admin.name}' force-released lock. "
+        f"Previous holder: {prev_holder or 'none'} (expired={prev_expires})"
+    )
+
+    return {
+        "force_released": True,
+        "previous_holder": prev_holder,
+        "previous_expires_at": prev_expires,
+    }

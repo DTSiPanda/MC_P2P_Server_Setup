@@ -99,6 +99,22 @@ class AdminClient:
             raise APIError(resp.status_code, resp.text)
         return resp.json()
 
+    def force_release_lock(self) -> dict[str, Any]:
+        """Admin only: forcefully release a stuck/stale lock held by any player."""
+        url = f"{self.api_url}/admin/lock/force-release"
+        resp = requests.post(url, headers=self._headers(), timeout=10)
+        if resp.status_code != 200:
+            raise APIError(resp.status_code, resp.text)
+        return resp.json()
+
+    def cloud_clear(self) -> dict[str, Any]:
+        """Admin only: wipe ALL cloud world data from R2 and reset lock + host state."""
+        url = f"{self.api_url}/admin/cloud/clear"
+        resp = requests.post(url, headers=self._headers(), timeout=30)
+        if resp.status_code != 200:
+            raise APIError(resp.status_code, resp.text)
+        return resp.json()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minecraft P2P Admin CLI")
@@ -119,6 +135,18 @@ def main() -> None:
     # revoke
     p_rev = sub.add_parser("revoke", help="Revoke player access")
     p_rev.add_argument("--player-id", required=True)
+
+    # force-release-lock
+    sub.add_parser(
+        "force-release-lock",
+        help="Force-release a stuck lock held by any player (admin override)",
+    )
+
+    # cloud-clear
+    sub.add_parser(
+        "cloud-clear",
+        help="Wipe ALL cloud world data and reset lock/host state (nuclear option)",
+    )
 
     args = parser.parse_args()
 
@@ -147,6 +175,19 @@ def main() -> None:
         elif args.cmd == "revoke":
             res = client.revoke_player(args.player_id)
             print(f"Player {args.player_id} revoked successfully.")
+        elif args.cmd == "force-release-lock":
+            res = client.force_release_lock()
+            prev = res.get("previous_holder") or "nobody"
+            print(f"Lock force-released. Previous holder: {prev}")
+        elif args.cmd == "cloud-clear":
+            confirm = input("This will DELETE ALL cloud world data. Type 'yes' to confirm: ").strip()
+            if confirm.lower() != "yes":
+                print("Aborted.")
+                sys.exit(0)
+            res = client.cloud_clear()
+            prev = res.get("previous_lock_holder") or "nobody"
+            print(f"Cloud cleared. Previous lock holder: {prev}")
+            print("Cloud is now empty. Upload a new world to start fresh.")
     except APIError as exc:
         print(f"Admin Error: {exc}", file=sys.stderr)
         sys.exit(1)

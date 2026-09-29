@@ -418,3 +418,28 @@ class TestForceKillScenario:
 
         finally:
             _PLAYERS.pop("player2-token", None)
+
+
+class TestGameLauncher:
+    def test_find_tlauncher_finds_default_minecraft_location(self, tmp_path, monkeypatch):
+        from client.game_launcher import find_tlauncher
+        mock_tlauncher = tmp_path / ".minecraft" / "TLauncher.exe"
+        mock_tlauncher.parent.mkdir(parents=True)
+        mock_tlauncher.write_text("fake exe")
+
+        monkeypatch.setattr("client.game_launcher._APPDATA", tmp_path)
+        monkeypatch.setattr("client.game_launcher.TLAUNCHER_CANDIDATES", [mock_tlauncher])
+        monkeypatch.setattr("client.game_launcher.get_saved_launcher_path", lambda: None)
+
+        found = find_tlauncher()
+        assert found == mock_tlauncher
+
+    def test_saved_launcher_path_priority(self, tmp_path, monkeypatch):
+        from client.game_launcher import find_tlauncher
+        custom = tmp_path / "custom" / "launcher.exe"
+        custom.parent.mkdir(parents=True)
+        custom.write_text("fake")
+
+        monkeypatch.setattr("client.game_launcher.get_saved_launcher_path", lambda: custom)
+        assert find_tlauncher() == custom
+

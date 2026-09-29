@@ -39,6 +39,7 @@ from client.auth import (
     launch_tailscale_login,
     poll_join_status,
 )
+from client.game_launcher import find_tlauncher, save_launcher_path
 from client.guest_connect import cmd_join
 from client.host_session import run_host_session
 from client.lan_sniffer import get_tailscale_ip
@@ -350,6 +351,29 @@ class AppUI(tk.Tk):
         btn_manual_upload = ttk.Button(f_world, text="☁ Upload to Cloud", command=self._on_click_manual_upload)
         btn_manual_upload.pack(side=tk.LEFT, padx=4)
 
+        # Launcher Row
+        f_launcher = ttk.Frame(self.frame_main)
+        f_launcher.pack(fill=tk.X, pady=(2, 6))
+
+        detected_launcher = find_tlauncher()
+        launcher_display = detected_launcher.name if detected_launcher else "Not detected"
+        self.lbl_launcher = ttk.Label(f_launcher, text=f"Launcher: {launcher_display}", font=("Segoe UI", 9))
+        self.lbl_launcher.pack(side=tk.LEFT, padx=2)
+
+        def on_browse_launcher():
+            chosen = filedialog.askopenfilename(
+                title="Select Minecraft Launcher (e.g. TLauncher.exe)",
+                filetypes=[("Executables", "*.exe;*.jar;*.lnk"), ("All files", "*.*")],
+                parent=self,
+            )
+            if chosen:
+                save_launcher_path(chosen)
+                self.lbl_launcher.configure(text=f"Launcher: {Path(chosen).name}")
+                self.log(f"[app] Launcher path set to: {chosen}")
+
+        btn_browse_launcher = ttk.Button(f_launcher, text="Select Launcher...", width=16, command=on_browse_launcher)
+        btn_browse_launcher.pack(side=tk.RIGHT, padx=4)
+
         # Action Buttons
         f_actions = ttk.Frame(self.frame_main)
         f_actions.pack(fill=tk.X, pady=8)
@@ -449,8 +473,10 @@ class AppUI(tk.Tk):
                     world_dir=self.world_dir,
                     log=self.log,
                 )
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 self.log(f"[host] Session ended: {exc}")
+            except BaseException as exc:
+                self.log(f"[host] Unexpected session termination: {exc}")
             finally:
                 self.is_hosting = False
                 self.after(0, lambda: self.btn_host.configure(state=tk.NORMAL))

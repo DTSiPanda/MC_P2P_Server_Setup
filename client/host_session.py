@@ -60,7 +60,7 @@ def run_host_session(
         check_compatibility(api, current_client_version=client_version, local_mc_version=local_mc_version)
     except Exception as exc:
         log(f"[host] Version error: {exc}")
-        sys.exit(1)
+        raise RuntimeError(f"Version error: {exc}")
 
     def on_lock_lost() -> None:
         nonlocal lock_lost
@@ -78,38 +78,38 @@ def run_host_session(
     owner_token = _load_session(world_dir)
     if owner_token is None:
         log("[host] No session token found after download. Aborting.")
-        sys.exit(1)
+        raise RuntimeError("No session token found after download. Aborting.")
 
-    # ── 3.  Launch TLauncher ───────────────────────────────────────────────
-    log("[host] Launching TLauncher…")
+    # ── 3.  Launch TLauncher / Minecraft ──────────────────────────────────
+    log("[host] Launching TLauncher / Minecraft…")
     launch_ts = time.time()
     try:
         launch_tlauncher(tlauncher_path)
+        log("[host] Launcher started. Load your world and open it to LAN.")
     except FileNotFoundError as exc:
-        log(f"[host] {exc}")
-        sys.exit(1)
-    log("[host] TLauncher started. Load your world and open it to LAN.")
+        log(f"[host] Note: {exc}")
+        log("[host] If launcher didn't start, please start Minecraft manually and open your world to LAN...")
 
     # ── 4.  Wait for Minecraft process ────────────────────────────────────
-    log("[host] Waiting for Minecraft (javaw) to start…")
+    log("[host] Waiting for Minecraft to start…")
     try:
         mc_proc = wait_for_minecraft(launched_after=launch_ts)
         log(f"[host] Minecraft detected (PID {mc_proc.pid}).")
     except TimeoutError as exc:
         log(f"[host] {exc}")
-        sys.exit(1)
+        raise RuntimeError(str(exc))
 
     # ── 5.  Sniff LAN port ────────────────────────────────────────────────
     log("[host] Waiting for LAN announcement (open world to LAN in-game)…")
     port = sniff_port(timeout=LAN_SNIFF_TIMEOUT)
     if port is None:
         log("[host] Port sniffing timed out.")
-        raw = input("[host] Enter port manually: ").strip()
         try:
+            raw = input("[host] Enter port manually: ").strip()
             port = int(raw)
-        except ValueError:
-            log("[host] Invalid port. Aborting.")
-            sys.exit(1)
+        except (ValueError, EOFError):
+            log("[host] Invalid port or no input available. Aborting.")
+            raise RuntimeError("LAN port sniffing timed out and no manual port was provided.")
     log(f"[host] LAN port: {port}")
 
     # ── 6.  Post host address ─────────────────────────────────────────────

@@ -2,7 +2,7 @@
 
 > **The Big Idea:** Imagine playing on a shared Minecraft world with your friends that costs **$0/month** and doesn't rely on an expensive 24/7 paid server. Instead of the world being trapped on one person's computer, the save file lives safely in the cloud. Whoever wants to play simply clicks **"Host World"**, picks up the world "baton", and friends connect peer-to-peer with zero port forwarding or IP typing. When the host logs off, the world automatically syncs back to the cloud so the next friend can take over whenever they want.
 
-**Under the Hood:** **P2P-WorldSync** is a decentralized, fault-tolerant game-state relay and peer-to-peer coordination architecture. It decouples persistent world state from local client compute by coupling an atomic distributed lease protocol over S3-compatible Cloudflare R2 object storage with automated Tailscale WireGuard mesh networking. By treating the hosting player as an ephemeral compute node governed by a 30-second heartbeat mutual exclusion lease, any authorized peer can dynamically acquire write authority, stream and atomically unpack authoritative world archives, capture dynamic runtime ports via UDP multicast sniffing, and establish direct peer-to-peer tunnels across Carrier-Grade NAT (CGNAT) boundaries—achieving zero-cost persistent multiplayer with zero manual port forwarding and zero ongoing server compute.
+**Under the Hood:** **P2P-WorldSync** couples a centralized control plane (FastAPI on Render) with peer-to-peer gameplay hosting and Cloudflare R2 object storage. Rather than running a continuous dedicated server, the control plane coordinates an in-memory lease-based lock with 30-second heartbeats. Any authorized peer can dynamically acquire the hosting lease, stream and unpack authoritative world archives from Cloudflare R2, capture dynamic runtime LAN ports via UDP multicast sniffing, and establish direct peer-to-peer WireGuard tunnels across Carrier-Grade NAT (CGNAT) boundaries—achieving persistent multiplayer with zero manual port forwarding and zero ongoing server compute costs while cloud free tiers last.
 
 ---
 
@@ -10,9 +10,9 @@
 
 | Approach | Limitations & Pain Points | P2P-WorldSync Solution |
 |---|---|---|
-| **24/7 Paid Server** *(Realms, VPS)* | Costs \$5–\$20/month even when idle; complex configuration and latency overhead. | **$0/month forever.** Runs on free-tier serverless infrastructure (Render + Cloudflare R2). No idle server compute. |
-| **Vanilla Singleplayer / LAN** | World save is locked to one person's hard drive; nobody can play if the creator is offline. | **Decoupled cloud world state.** The world "baton" is stored in R2. Whoever clicks **Host** downloads the latest save and plays. |
-| **Hamachi / Port Forwarding** | Router CGNAT blocks, firewall vulnerabilities, clunky VPN tools, and manual IP copy-pasting. | **Encrypted private mesh network.** Automated Tailscale WireGuard tunnels bypass CGNAT with zero router port forwarding. |
+| **24/7 Paid Server** *(Realms, VPS)* | Costs \$5–\$20/month even when idle; complex server management and recurring billing. | **Zero cost while cloud free tiers last.** Uses free-tier infrastructure (Render web service + Cloudflare R2 storage). Zero idle compute costs. |
+| **Vanilla Singleplayer / LAN** | World save is locked to one person's hard drive; nobody can play if the creator is offline. | **Decoupled cloud world state.** The authoritative world archive is stored in R2. Whoever clicks **Host** downloads the latest save and hosts for the group. |
+| **Hamachi / Port Forwarding** | Router CGNAT blocks, firewall vulnerabilities, clunky VPN tools, and manual IP copy-pasting. | **Encrypted WireGuard mesh network.** Automated Tailscale tunnels bypass CGNAT, usually establishing direct P2P connections with zero open router ports. |
 
 ---
 
@@ -20,14 +20,14 @@
 
 ```mermaid
 flowchart TD
-    subgraph Control_Plane["Control Plane (FastAPI on Render)"]
+    subgraph Control_Plane["Centralized Control Plane (FastAPI on Render)"]
         API["REST API Controller\n(Lease Engine, Invites, Auth)"]
-        LockEngine["Distributed Lease Engine\n(TTL + Nonce Verification)"]
+        LockEngine["Centralized Lease Lock\n(In-Memory TTL + Nonce Verification)"]
         API --- LockEngine
     end
 
-    subgraph Storage_Plane["Storage Plane (Cloudflare R2 - S3 API)"]
-        R2_Worlds[("Versioned World Archives\nworlds/<UUID>.zip")]
+    subgraph Storage_Plane["Object Storage Plane (Cloudflare R2 - S3 API)"]
+        R2_Worlds[("Versioned World Archives\nworlds/{uuid}.zip")]
         R2_State[("Durable State Registry\nstate/player_state.json")]
     end
 
@@ -59,29 +59,82 @@ flowchart TD
 
 ### Technical Pillars
 
-1. **Distributed Mutual Exclusion (Lease Protocol):** Cloud write access is protected by an in-memory lease with a 32-byte cryptographic token. The active host sends heartbeats every 30 seconds. If a host crashes or disconnects, the lease automatically expires after 90 seconds, preventing split-brain world forks.
-2. **Zero-Config P2P Discovery & CGNAT Traversal:** Peer traffic routes through an encrypted Tailscale WireGuard virtual network (`100.x.y.z`), bypassing residential CGNAT without opening firewall ports. An internal UDP multicast socket listens on `224.0.2.60:4445` to capture the random LAN port, and the client directly injects it into Minecraft's binary `servers.dat` via `nbtlib`.
-3. **Atomic Cloud Sync & Safety Backups:** Uploads write to immutable UUID keys in Cloudflare R2 (`worlds/<UUID>.zip`) and advance the pointer only after SHA-256 verification. If local singleplayer changes are detected before syncing, an automatic timestamped backup is preserved locally.
-4. **Crash-Resilient State Persistence:** To accommodate ephemeral serverless runtimes (Render free-tier sleep cycles), player tokens and invite registries are serialized to `state/player_state.json` on Cloudflare R2 and restored automatically upon cold start.
+1. **Centralized Lease-Based Lock:** Single-host exclusivity is enforced by an in-memory lease on the Render control plane using a 32-byte cryptographic nonce (`owner_token`). The active host renews its lease every 30 seconds via `/lock/heartbeat`. If the host unexpectedly crashes or drops offline, the lease expires after a 90-second TTL, preventing split-brain world forks.
+2. **CGNAT Traversal & Socket Discovery:** Peer traffic routes through a private Tailscale WireGuard virtual network (`100.64.0.0/10`), bypassing residential CGNAT without opening firewall ports. Connections are direct peer-to-peer in most network environments, falling back to encrypted DERP relays only if both peers are behind strict symmetric firewalls. An internal UDP multicast socket listens on `224.0.2.60:4445` to capture the ephemeral LAN port, and the client directly injects it into Minecraft's binary `servers.dat` via `nbtlib`.
+3. **Atomic Cloud Sync & Safety Backups:** Uploads write to immutable UUID keys in Cloudflare R2 (`worlds/{uuid}.zip`) and advance the pointer only after SHA-256 verification. If local singleplayer modifications are detected before syncing, an automatic timestamped backup is preserved locally.
+4. **Durable State Persistence:** While the lease lock is in-memory on Render, player tokens, identities, and invite codes are serialized to `state/player_state.json` on Cloudflare R2. On cold starts or redeployments, the server restores this registry immediately.
+
+---
+
+## ⚡ Cold-Start & Crash Recovery Architecture
+
+A common failure mode on containerized serverless hosting (such as Render's free tier) is an unexpected cold-start, container sleep, or restart mid-session:
+
+- **What happens to the Lease:** Because the lease lock lives in memory on Render, a mid-session server restart clears the lease and host address.
+- **Heartbeat Detection:** The active host client heartbeat thread detects the loss via an `HTTP 410 Gone` or connection retry backoff and logs an immediate warning to the UI console: `⚠️ Lock lost! Another player may become host. Save your game NOW.`
+- **Safe Commit & Re-acquisition:** When the host exits Minecraft (or during the 10-minute background autosave), the sync engine catches the expired token, automatically requests a fresh lease from the newly restarted server, and safely commits the final world archive to Cloudflare R2—ensuring zero data loss.
 
 ---
 
 ## 🕹️ Quickstart: How to Play
 
+[![Download](https://img.shields.io/badge/Download-MinecraftP2P.exe_(Latest)-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/DTSiPanda/decentralised_serverless_hosting_for_minecraft/releases/latest)
+
 ### 1. First-Time Setup (Once Only)
-1. Run `MinecraftP2P.exe`.
-2. Enter the single-use invite code from your server admin, your display name, and email.
-3. Click the Tailscale invite link shown on screen to join the private mesh network.
+1. Download `MinecraftP2P.exe` from [GitHub Releases](https://github.com/DTSiPanda/decentralised_serverless_hosting_for_minecraft/releases/latest).
+2. Run the application, enter the single-use invite code from your administrator, your display name, and email.
+3. The app displays an interactive dialog with your personalized Tailscale invite link (and opens your browser). Click the link to join the private mesh network. Your token is saved securely in Windows Credential Manager.
 
 ### 2. To Host the World
 1. Click **🎮 Host World**. The app syncs the newest cloud save and launches Minecraft.
 2. In Minecraft: Press `Esc` $\rightarrow$ **Open to LAN** $\rightarrow$ **Start LAN World**.
-3. The app auto-detects your port and broadcasts your connection. While you play, it automatically backs up the world to the cloud every 10 minutes.
+3. The app auto-detects your port and broadcasts your connection. While you play, it automatically backs up the world to the cloud every 10 minutes in the background.
 
 ### 3. To Join as a Guest
 1. Check the app banner (shows **"🟢 [Host] is hosting"**).
 2. Click **🚀 Join World**.
 3. Open Minecraft $\rightarrow$ **Multiplayer** $\rightarrow$ Double-click **"OurWorld (P2P)"** at the top of your server list!
+
+---
+
+## ⚠️ Prerequisites & Known Limitations
+
+| Parameter | Specification / Detail |
+|---|---|
+| **Operating System** | **Windows 10 / 11 (64-bit)** only. |
+| **Minecraft Version** | Java Edition **1.20.1**. Compatible with official Minecraft Launcher, TLauncher, Prism, Modrinth, Fabric, or Forge (any launcher creating standard `.minecraft` saves). |
+| **Host Hardware & Ping** | Because the active host runs the Minecraft server instance on their local PC, game tick rates (TPS) and player latency depend on the host's CPU, RAM, and upload bandwidth. |
+| **Tailscale Capacity** | Free personal Tailscale tailnets accommodate up to **3 to 6 members** (including the administrator). Exceeding this requires a paid Tailscale tier or manual node sharing. |
+| **Unsigned Executable Warning** | Because `MinecraftP2P.exe` is compiled from source without an expensive commercial code-signing certificate, Windows SmartScreen will display an alert (*"Windows protected your PC"*). Click **"More info"** $\rightarrow$ **"Run anyway"**. |
+
+---
+
+## 🔒 Security Posture & Tailscale Configuration
+
+### 1. Tailscale Authentication: Use OAuth Client Credentials
+While the API accepts Personal Access Tokens (`TAILSCALE_API_KEY`), **Personal Access Tokens expire after 90 days maximum**, causing automated user invites to silently fail. 
+
+It is strongly recommended to configure a long-lived **Tailscale OAuth Client**:
+1. In Tailscale Admin Console $\rightarrow$ **Settings** $\rightarrow$ **OAuth Clients** $\rightarrow$ **Generate OAuth Client**.
+2. Grant permission: `User Invites (Write)` and `Users (Read)`.
+3. Set environment variables on Render:
+   - `TAILSCALE_CLIENT_ID=tskey-client-...`
+   - `TAILSCALE_CLIENT_SECRET=tskey-secret-...`
+
+### 2. Tailscale ACL Policy & Firewall
+In **Tailscale Admin $\rightarrow$ Access Controls**, set an open policy for peers:
+```json
+{
+  "acls": [
+    { "action": "accept", "src": ["*"], "dst": ["*:*"] }
+  ]
+}
+```
+
+> ⚠️ **Firewall Notice:** The open ACL (`*` to `*:*`) permits peers to communicate across all ports on the virtual WireGuard subnet. While standard and convenient for a small, trusted friend group, all players should **keep their Windows Defender Firewall active**, or restrict the ACL to `autogroup:member` and specific game ports if playing with less trusted peers.
+
+### 3. Credential Security in Git
+Never commit `.env` or sensitive API keys. If keys were ever committed in prior git revisions, rotate them immediately in the Cloudflare and Tailscale dashboards, as git history preserves past commit contents.
 
 ---
 
@@ -101,18 +154,9 @@ flowchart TD
 | `R2_ACCESS_KEY_ID` | Cloudflare R2 API access key. |
 | `R2_SECRET_ACCESS_KEY` | Cloudflare R2 API secret key. |
 | `R2_BUCKET_NAME` | R2 Bucket name (e.g. `minecraft-p2p`). |
-| `TAILSCALE_API_KEY` | Tailscale Personal Access Token / OAuth Client Secret. |
+| `TAILSCALE_CLIENT_ID` | Tailscale OAuth Client ID *(Recommended)*. |
+| `TAILSCALE_CLIENT_SECRET` | Tailscale OAuth Client Secret *(Recommended)*. |
 | `TAILSCALE_TAILNET` | Set to `-` (default tailnet). |
-
-### Tailscale Access Control (ACL)
-In **Tailscale Admin $\rightarrow$ Access Controls**, set an open policy for peers:
-```json
-{
-  "acls": [
-    { "action": "accept", "src": ["*"], "dst": ["*:*"] }
-  ]
-}
-```
 
 ### Compiling the Client Executable
 To build the standalone Windows executable from source:
@@ -156,7 +200,7 @@ Minecraft_p2p/
 ├── .env.example                # Template for server environment variables
 ├── .gitignore                  # Exclusions for Python, artifacts, logs, and secrets
 ├── LICENSE                     # MIT Open Source License
-└── README.md                   # Project documentation
+└── README.md                   # Technical documentation
 ```
 
 ---

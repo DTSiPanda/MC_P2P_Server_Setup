@@ -1,10 +1,11 @@
 """
-Minecraft P2P API – Phase 1 through Phase 5.
+Minecraft P2P API – Phase 1 through Phase 6 (Hardened).
 
 Phase 1 – Lock, heartbeat, release, host address, /host
 Phase 2 – /config, /world/upload-url, /world/commit, R2 storage
 Phase 5 – App invite codes, /join, Tailscale user-invites, /join/status,
            admin endpoints (/admin/invite-code, /admin/players, /admin/revoke)
+Phase 6 – Rate limiting, admin lockout, persistent file logging, error recovery.
 """
 
 import hashlib
@@ -16,9 +17,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
+# Configure logging to both console and minecraft_p2p.log
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("minecraft_p2p.log", mode="a", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger("minecraft_p2p")
 
 app = FastAPI(title="Minecraft P2P API", version="0.3.0")
@@ -100,6 +110,12 @@ _players_registry: dict[str, PlayerRecord] = {}       # id -> PlayerRecord
 _token_hash_to_player_id: dict[str, str] = {}         # token_hash -> id
 _invites: dict[str, InviteRecord] = {}                 # code_hash -> InviteRecord
 
+# Rate limiting and lockout state
+_RATE_LIMIT_WINDOWS: dict[str, list[float]] = {}
+_ADMIN_FAILURES: dict[str, list[float]] = {}
+_ADMIN_LOCKOUT_MAX = 5
+_ADMIN_LOCKOUT_WINDOW = 300.0  # 5 minutes
+
 # Default dev/phase1 token support & backward compatibility
 _PHASE1_TOKEN = os.getenv("PLAYER_TOKEN", "phase1-dev-token")
 
@@ -127,6 +143,46 @@ _PLAYERS: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Rate limiting & Security helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_rate_limit(request: Request, key: str, max_requests: int = 30, window_seconds: float = 60.0):
+    client_ip = request.client.host if request.client else "unknown"
+    bucket_key = f"{key}:{client_ip}"
+    now = time.time()
+    timestamps = _RATE_LIMIT_WINDOWS.setdefault(bucket_key, [])
+    timestamps[:] = [t for t in timestamps if t > now - window_seconds]
+    if len(timestamps) >= max_requests:
+        logger.warning(f"Rate limit exceeded on {key} by {client_ip}")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many requests to {key}. Please wait a moment.",
+        )
+    timestamps.append(now)
+
+
+def _check_admin_lockout(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    fails = _ADMIN_FAILURES.setdefault(client_ip, [])
+    fails[:] = [t for t in fails if t > now - _ADMIN_LOCKOUT_WINDOW]
+    if len(fails) >= _ADMIN_LOCKOUT_MAX:
+        logger.warning(f"Locked out IP {client_ip} attempted admin access")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Admin access temporarily locked out due to multiple failed attempts. Try again in 5 minutes.",
+        )
+
+
+def _record_admin_failure(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    fails = _ADMIN_FAILURES.setdefault(client_ip, [])
+    fails.append(now)
+
+
+# ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
 
@@ -149,7 +205,6 @@ def _get_player_record(x_api_token: str = Header(...)) -> PlayerRecord:
     # Check test backdoor _PLAYERS
     if x_api_token in _PLAYERS:
         name = _PLAYERS[x_api_token]
-        # Check if there's an existing registered player with this name
         for p in _players_registry.values():
             if p.name == name:
                 if p.revoked:
@@ -158,7 +213,6 @@ def _get_player_record(x_api_token: str = Header(...)) -> PlayerRecord:
                         detail="Player access has been revoked",
                     )
                 return p
-        # Otherwise create an on-the-fly dummy record
         synthetic = PlayerRecord(
             id=f"syn-{name}",
             name=name,
@@ -178,16 +232,20 @@ def _get_player(x_api_token: str = Header(...)) -> str:
 
 
 def _verify_admin(
+    request: Request,
     x_admin_secret: str = Header(...),
     player: PlayerRecord = Depends(_get_player_record),
 ) -> PlayerRecord:
     """
     Verify admin request.
     Requires valid player token + valid x-admin-secret header.
-    Constant-time comparison via hmac.compare_digest.
+    Constant-time comparison via hmac.compare_digest and lockout on failures.
     """
+    _check_admin_lockout(request)
+
     admin_secret = os.getenv("ADMIN_SECRET", "dev-admin-secret")
     if not hmac.compare_digest(x_admin_secret.strip().encode(), admin_secret.strip().encode()):
+        _record_admin_failure(request)
         logger.warning(f"Unauthorized admin attempt by player {player.name} (id={player.id})")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin secret")
     return player
@@ -343,7 +401,8 @@ class RevokePlayerResponse(BaseModel):
 
 
 @app.post("/lock/acquire", status_code=200, response_model=LockAcquireResponse)
-def lock_acquire(player: str = Depends(_get_player)):
+def lock_acquire(request: Request, player: str = Depends(_get_player)):
+    _check_rate_limit(request, "lock_acquire", max_requests=60, window_seconds=60.0)
     import server.r2 as r2
 
     now = time.time()
@@ -511,11 +570,12 @@ def world_commit(body: CommitRequest):
 
 
 @app.post("/join", response_model=JoinResponse)
-def player_join(body: JoinRequest):
+def player_join(request: Request, body: JoinRequest):
     """
     Onboarding: verifies single-use app invite code, invites user to Tailscale tailnet,
     creates player, and issues a persistent API token.
     """
+    _check_rate_limit(request, "join", max_requests=20, window_seconds=60.0)
     import server.tailscale as tailscale_mod
 
     code_clean = body.invite_code.strip()
@@ -529,7 +589,6 @@ def player_join(body: JoinRequest):
             detail="Invalid or expired invite code",
         )
 
-    # Check Tailscale free tier cap (6 users max)
     active_count = sum(1 for p in _players_registry.values() if not p.revoked)
     if active_count >= 6:
         raise HTTPException(
@@ -537,16 +596,13 @@ def player_join(body: JoinRequest):
             detail="Tailnet capacity reached (maximum 6 players)",
         )
 
-    # Decrement invite uses
     invite.uses_left -= 1
 
-    # Request Tailscale user invite via API
     ts_client = tailscale_mod.get_tailscale_client()
     ts_invite = ts_client.create_user_invite(body.email.strip())
     invite_id = ts_invite.get("id")
     invite_url = ts_invite.get("inviteUrl")
 
-    # Generate persistent player token
     raw_token = secrets.token_urlsafe(32)
     token_h = _hash(raw_token)
     player_id = secrets.token_hex(6)
@@ -575,10 +631,6 @@ def player_join(body: JoinRequest):
 
 @app.get("/join/status", response_model=JoinStatusResponse)
 def player_join_status(player: PlayerRecord = Depends(_get_player_record)):
-    """
-    Poll status after /join. Reports whether the Tailscale invite was accepted
-    (the user appears in the tailnet).
-    """
     import server.tailscale as tailscale_mod
 
     ts_client = tailscale_mod.get_tailscale_client()
@@ -596,9 +648,6 @@ def admin_create_invite_code(
     body: CreateInviteRequest,
     admin: PlayerRecord = Depends(_verify_admin),
 ):
-    """
-    Admin only: Generate a new single-use app invite code.
-    """
     raw_code = f"MC-{secrets.token_hex(4).upper()}"
     code_h = _hash(raw_code)
     now = time.time()
@@ -623,9 +672,6 @@ def admin_create_invite_code(
 
 @app.get("/admin/players", response_model=AdminPlayersResponse)
 def admin_list_players(admin: PlayerRecord = Depends(_verify_admin)):
-    """
-    Admin only: List all players and Tailscale slot usage.
-    """
     summaries = [
         PlayerSummary(
             id=p.id,
@@ -650,10 +696,6 @@ def admin_revoke_player(
     body: RevokePlayerRequest,
     admin: PlayerRecord = Depends(_verify_admin),
 ):
-    """
-    Admin only: Revoke a player's API token, delete pending Tailscale invite,
-    and release the lock if currently held by the player.
-    """
     import server.tailscale as tailscale_mod
 
     player = _players_registry.get(body.player_id)
@@ -665,7 +707,6 @@ def admin_revoke_player(
 
     player.revoked = True
 
-    # If the revoked player currently holds the lock, immediately release it
     if _lock.holder_name == player.name:
         _lock.holder_name = None
         _lock.owner_token_hash = None
@@ -675,7 +716,6 @@ def admin_revoke_player(
         _host.host_name = None
         _host.updated_at = None
 
-    # Delete Tailscale invite if one was pending
     if player.tailscale_invite_id:
         ts_client = tailscale_mod.get_tailscale_client()
         ts_client.delete_user_invite(player.tailscale_invite_id)

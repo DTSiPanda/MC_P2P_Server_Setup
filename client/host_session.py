@@ -1,20 +1,18 @@
 """
-host_session.py – orchestrates the full host flow (Phase 3).
+host_session.py – orchestrates the full host flow with autosaving, version checks, and handoff warnings.
 
 Step-by-step:
+  0.  Check client compatibility (/config)
   1.  Acquire lock  →  get presigned download URL
-  2.  Download & unpack world
+  2.  Download & unpack world (with local conflict resolution)
   3.  Launch TLauncher
   4.  Wait for javaw.exe (Minecraft) to start
   5.  Wait for LAN announcement  →  parse port  (fallback: manual entry)
   6.  POST /host/address  with Tailscale IP + port
-  7.  Start heartbeat thread
+  7.  Start heartbeat & autosave threads
   8.  Block until Minecraft exits
-  9.  Stop heartbeat
+  9.  Stop heartbeat & autosave
   10. Pack & upload world, commit, release lock
-
-All external dependencies (launcher, sniffer, download/upload) are imported
-at the module level so tests can patch them at 'client.host_session.*'.
 """
 
 from __future__ import annotations
@@ -24,11 +22,17 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from client.api_client import APIClient, APIError
+from client.api_client import APIClient, APIError, check_compatibility
+from client.autosave import AutosaveThread
 from client.game_launcher import launch_tlauncher, wait_for_exit, wait_for_minecraft
 from client.heartbeat import HeartbeatThread
 from client.lan_sniffer import get_tailscale_ip, sniff_port
-from client.world_sync import _load_session, cmd_download, cmd_upload
+from client.world_sync import (
+    _load_session,
+    cmd_download,
+    cmd_upload,
+    upload_and_commit_world,
+)
 
 LAN_SNIFF_TIMEOUT = 120   # seconds to wait for the LAN announcement
 
@@ -38,15 +42,25 @@ def run_host_session(
     token: str,
     world_dir: Path,
     *,
+    client_version: str = "0.1.0",
+    local_mc_version: Optional[str] = None,
+    autosave_interval: float = 600,
     tlauncher_path: Optional[Path] = None,
     log: Callable[[str], None] = print,
 ) -> None:
     """
-    Run a complete host session.  Blocks until the world is uploaded and the
-    lock is released.  Calls sys.exit(1) on unrecoverable errors.
+    Run a complete host session. Blocks until the world is uploaded and the
+    lock is released. Calls sys.exit(1) on unrecoverable errors.
     """
     api = APIClient(api_url, token)
     lock_lost = False
+
+    # ── 0.  Compatibility Check ──────────────────────────────────────────
+    try:
+        check_compatibility(api, current_client_version=client_version, local_mc_version=local_mc_version)
+    except Exception as exc:
+        log(f"[host] Version error: {exc}")
+        sys.exit(1)
 
     def on_lock_lost() -> None:
         nonlocal lock_lost
@@ -109,20 +123,38 @@ def run_host_session(
     except APIError as exc:
         log(f"[host] Warning – could not post host address: {exc}")
 
-    # ── 7.  Start heartbeat ───────────────────────────────────────────────
+    # ── 7.  Start heartbeat & autosave ────────────────────────────────────
     hb = HeartbeatThread(
         heartbeat_fn=api.heartbeat,
         owner_token=owner_token,
         on_lock_lost=on_lock_lost,
     )
     hb.start()
-    log("[host] Heartbeat running. Playing…")
+
+    def do_autosave() -> None:
+        if not lock_lost:
+            try:
+                upload_and_commit_world(api_url, owner_token, world_dir, release=False, log=log)
+            except Exception as e:
+                log(f"[host] Autosave warning: {e}")
+
+    autosave = AutosaveThread(
+        autosave_fn=do_autosave,
+        interval=autosave_interval,
+        log=log,
+    )
+    autosave.start()
+
+    log("[host] Heartbeat & autosave running. Playing…")
 
     # ── 8.  Wait for Minecraft to exit ────────────────────────────────────
     wait_for_exit(mc_proc)
     log("[host] Minecraft closed.")
 
-    # ── 9.  Stop heartbeat ────────────────────────────────────────────────
+    # ── 9.  Stop heartbeat & autosave ─────────────────────────────────────
+    autosave.stop()
+    autosave.join(timeout=5)
+
     hb.stop()
     hb.join(timeout=5)
 
@@ -130,7 +162,7 @@ def run_host_session(
         log("[host] Lock was lost during the session. Attempting upload anyway…")
 
     # ── 10.  Upload world, commit, release ────────────────────────────────
-    log("[host] Uploading world to cloud…")
+    log("[host] Uploading final world to cloud…")
     try:
         cmd_upload(api_url, token, world_dir)
     except SystemExit:

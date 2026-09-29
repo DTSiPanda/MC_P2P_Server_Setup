@@ -1,17 +1,11 @@
 """
-api_client.py – HTTP wrapper around the P2P API.
-
-Features:
-- Per-request timeout so a sleeping Render dyno never hangs forever.
-- Retry with exponential backoff on connection errors and cold-start codes (502/503/504).
-- Prints "Server waking up…" so the user knows what's happening.
-- Raises APIError with a status_code attribute so callers can branch on 409/410.
+api_client.py – HTTP wrapper around the P2P API with retry, backoff, and version validation.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Optional
 
 import requests
 
@@ -28,6 +22,38 @@ class APIError(Exception):
         self.status_code = status_code
         self.detail = detail
         super().__init__(f"HTTP {status_code}: {detail}")
+
+
+def parse_version_tuple(v: str) -> tuple[int, ...]:
+    clean = v.split("-")[0].split("+")[0]
+    return tuple(int(x) for x in clean.split(".") if x.isdigit())
+
+
+def check_compatibility(
+    client: APIClient,
+    current_client_version: str = "0.1.0",
+    local_mc_version: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Checks /config and validates client and Minecraft version compatibility.
+    Raises RuntimeError if version is incompatible.
+    """
+    cfg = client.get_config()
+    min_client_v = cfg.get("min_client_version", "0.1.0")
+    required_mc_v = cfg.get("required_mc_version", "1.20.1")
+
+    if parse_version_tuple(current_client_version) < parse_version_tuple(min_client_v):
+        raise RuntimeError(
+            f"Client version {current_client_version} is outdated. "
+            f"Minimum required version is {min_client_v}. Please update the app."
+        )
+
+    if local_mc_version and local_mc_version.strip() != required_mc_v.strip():
+        raise RuntimeError(
+            f"Minecraft version mismatch: Installed {local_mc_version}, required {required_mc_v}."
+        )
+
+    return cfg
 
 
 class APIClient:

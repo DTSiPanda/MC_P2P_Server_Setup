@@ -1,26 +1,9 @@
 """
-world_sync.py – CLI script for Phase 2 world download/upload.
+world_sync.py – World download, pack, upload, commit, and conflict management.
 
-Usage:
-    python -m client.world_sync download --api-url URL --token TOKEN --world-dir PATH
-    python -m client.world_sync upload   --api-url URL --token TOKEN --world-dir PATH
-
-The script:
-  Download:
-    1. Calls POST /lock/acquire to get owner_token + presigned download URL.
-    2. Downloads the world zip.
-    3. Unpacks to a temp folder, then swaps into --world-dir atomically.
-
-  Upload:
-    1. Packs the world folder (excludes cache, logs, crash-reports).
-    2. Computes sha256 of the zip.
-    3. Calls POST /world/upload-url to get a presigned PUT URL.
-    4. PUTs the zip to R2.
-    5. Calls POST /world/commit to verify and move the 'current' pointer.
-    6. Calls POST /lock/release.
-
-Credentials / URLs never hard-coded – always passed as arguments or read from
-the environment variable PLAYER_TOKEN.
+Handles:
+- Section 6A Local world conflict rules (marker tracking, pending upload retries, backup rotation).
+- Section 7 Mid-upload kill and recovery.
 """
 
 from __future__ import annotations
@@ -39,18 +22,21 @@ from typing import Optional
 
 import requests
 
+from client.conflict_manager import (
+    check_and_resolve_conflict,
+    hash_world_folder,
+    load_marker,
+    save_marker,
+    set_upload_pending,
+)
+
 # Directories to exclude when packing the world
 PACK_EXCLUDES = {"cache", "logs", "crash-reports", "crash_reports"}
 
 # Retry / timeout settings (Render free tier can cold-start for ~30 s)
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 15
 MAX_RETRIES = 5
-RETRY_BACKOFF = 2.0  # seconds, doubled each attempt
-
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
+RETRY_BACKOFF = 2.0
 
 
 def _api(method: str, url: str, **kwargs) -> requests.Response:
@@ -60,23 +46,18 @@ def _api(method: str, url: str, **kwargs) -> requests.Response:
         try:
             r = requests.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
             return r
-        except requests.exceptions.ConnectionError as exc:
+        except (requests.ConnectionError, requests.Timeout) as exc:
             if attempt == MAX_RETRIES:
                 raise
-            print(f"  [world_sync] Server unreachable, retrying in {delay:.0f}s (attempt {attempt}/{MAX_RETRIES})…")
+            print(f"  [world_sync] Server unreachable/slow, retrying in {delay:.0f}s (attempt {attempt}/{MAX_RETRIES})…")
             time.sleep(delay)
             delay *= 2
-    raise RuntimeError("Unreachable")  # never reached
+    raise RuntimeError("Unreachable")
 
 
 def _die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Hashing
-# ---------------------------------------------------------------------------
 
 
 def sha256_of_file(path: Path) -> str:
@@ -91,11 +72,6 @@ def sha256_of_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# Pack / unpack
-# ---------------------------------------------------------------------------
-
-
 def pack_world(world_dir: Path, out_zip: Path) -> str:
     """
     Zip world_dir into out_zip, excluding PACK_EXCLUDES.
@@ -103,8 +79,7 @@ def pack_world(world_dir: Path, out_zip: Path) -> str:
     """
     world_dir = world_dir.resolve()
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for item in world_dir.rglob("*"):
-            # Skip excluded top-level subdirs
+        for item in sorted(world_dir.rglob("*")):
             try:
                 rel = item.relative_to(world_dir)
             except ValueError:
@@ -126,7 +101,6 @@ def unpack_world(zip_path: Path, target_dir: Path) -> None:
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(tmp)
 
-        # Remove old world dir and move the temp one in
         if target_dir.exists():
             old_backup = parent / f"{target_dir.name}_prev"
             if old_backup.exists():
@@ -139,13 +113,93 @@ def unpack_world(zip_path: Path, target_dir: Path) -> None:
         raise
 
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
+def upload_and_commit_world(
+    api_url: str,
+    owner_token: str,
+    world_dir: Path,
+    release: bool = False,
+    log=print,
+) -> str:
+    """
+    Pack, upload to R2, and commit the world.
+    If release=True, also calls POST /lock/release.
+    Updates the local conflict marker.
+    Returns the committed version key.
+    """
+    world_name = world_dir.name
+    # Set pending upload marker
+    set_upload_pending(world_name, True)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        zip_path = Path(tmp_dir) / "world.zip"
+
+        log(f"[world_sync] Packing {world_dir}…")
+        sha = pack_world(world_dir, zip_path)
+        size = zip_path.stat().st_size
+        log(f"[world_sync] Packed {size:,} bytes  sha256={sha[:12]}…")
+
+        log("[world_sync] Requesting upload URL…")
+        r_url = _api(
+            "POST",
+            f"{api_url}/world/upload-url",
+            json={"owner_token": owner_token, "size": size, "sha256": sha},
+        )
+        if r_url.status_code != 200:
+            _die(f"world/upload-url failed: {r_url.status_code} {r_url.text}")
+
+        url_data = r_url.json()
+        upload_url: str = url_data["upload_url"]
+        version_key: str = url_data["version_key"]
+
+        log(f"[world_sync] Uploading to R2 (key={version_key})…")
+        with open(zip_path, "rb") as f:
+            put_r = requests.put(upload_url, data=f, timeout=300)
+        if put_r.status_code not in (200, 204):
+            _die(f"PUT to R2 failed: {put_r.status_code}")
+
+        log("[world_sync] Committing version…")
+        r_commit = _api(
+            "POST",
+            f"{api_url}/world/commit",
+            json={"owner_token": owner_token, "version_key": version_key, "sha256": sha},
+        )
+        if r_commit.status_code != 200:
+            _die(f"world/commit failed: {r_commit.status_code} {r_commit.text}")
+
+        log(f"[world_sync] Committed: {version_key}")
+
+        # Update marker: successfully committed!
+        save_marker(
+            world_name=world_name,
+            version_id=version_key,
+            folder_hash=hash_world_folder(world_dir),
+            upload_pending=False,
+        )
+
+    if release:
+        log("[world_sync] Releasing lock…")
+        _api(
+            "POST",
+            f"{api_url}/lock/release",
+            json={"owner_token": owner_token},
+        )
+        _clear_session(world_dir)
+        log("[world_sync] Lock released.")
+
+    return version_key
 
 
 def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
-    """Acquire lock, download world, unpack."""
+    """Acquire lock, check conflicts, download world, unpack."""
+    world_name = world_dir.name
+
+    # Check local world conflict rules (Section 6A)
+    conflict = check_and_resolve_conflict(world_dir, world_name)
+    if conflict == "UPLOAD_PENDING":
+        print("[world_sync] Uncommitted session detected (upload_pending=True). Retrying upload first...")
+        cmd_upload(api_url, token, world_dir)
+        print("[world_sync] Previous session successfully saved. Now proceeding with download.")
+
     print("[world_sync] Acquiring lock…")
     r = _api(
         "POST",
@@ -161,12 +215,15 @@ def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
     data = r.json()
     owner_token: str = data["owner_token"]
     download_url: Optional[str] = data.get("download_url")
+    version_key = data.get("world_version_key")
 
     if download_url is None:
         print("[world_sync] No world in cloud yet. Starting fresh.")
+        save_marker(world_name, None, hash_world_folder(world_dir) if world_dir.exists() else None, False)
+        _save_session(world_dir, owner_token)
         return
 
-    print(f"[world_sync] Downloading world ({data.get('world_version_key', '')})…")
+    print(f"[world_sync] Downloading world ({version_key})…")
     dl = requests.get(download_url, timeout=120, stream=True)
     dl.raise_for_status()
 
@@ -181,8 +238,15 @@ def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
     finally:
         tmp_path.unlink(missing_ok=True)
 
+    # Save marker after successful download
+    save_marker(
+        world_name=world_name,
+        version_id=version_key,
+        folder_hash=hash_world_folder(world_dir),
+        upload_pending=False,
+    )
+
     print("[world_sync] Download complete.")
-    # Store owner_token for the upload step
     _save_session(world_dir, owner_token)
 
 
@@ -190,68 +254,19 @@ def cmd_upload(api_url: str, token: str, world_dir: Path) -> None:
     """Pack world, upload to R2, commit, release lock."""
     owner_token = _load_session(world_dir)
     if owner_token is None:
-        # Acquire a fresh lock if not already holding one (e.g. fresh-world scenario)
         print("[world_sync] No active session – acquiring lock…")
         r = _api("POST", f"{api_url}/lock/acquire", headers={"x-api-token": token})
         if r.status_code != 200:
             _die(f"lock/acquire failed: {r.status_code} {r.text}")
         owner_token = r.json()["owner_token"]
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        zip_path = Path(tmp_dir) / "world.zip"
-
-        print(f"[world_sync] Packing {world_dir}…")
-        sha = pack_world(world_dir, zip_path)
-        size = zip_path.stat().st_size
-        print(f"[world_sync] Packed {size:,} bytes  sha256={sha[:12]}…")
-
-        # Get presigned upload URL
-        print("[world_sync] Requesting upload URL…")
-        r_url = _api(
-            "POST",
-            f"{api_url}/world/upload-url",
-            json={"owner_token": owner_token, "size": size, "sha256": sha},
-        )
-        if r_url.status_code != 200:
-            _die(f"world/upload-url failed: {r_url.status_code} {r_url.text}")
-
-        url_data = r_url.json()
-        upload_url: str = url_data["upload_url"]
-        version_key: str = url_data["version_key"]
-
-        # Upload
-        print(f"[world_sync] Uploading to R2 (key={version_key})…")
-        with open(zip_path, "rb") as f:
-            put_r = requests.put(upload_url, data=f, timeout=300)
-        if put_r.status_code not in (200, 204):
-            _die(f"PUT to R2 failed: {put_r.status_code}")
-
-        # Commit
-        print("[world_sync] Committing version…")
-        r_commit = _api(
-            "POST",
-            f"{api_url}/world/commit",
-            json={"owner_token": owner_token, "version_key": version_key, "sha256": sha},
-        )
-        if r_commit.status_code != 200:
-            _die(f"world/commit failed: {r_commit.status_code} {r_commit.text}")
-
-        print(f"[world_sync] Committed: {version_key}")
-
-    # Release lock
-    print("[world_sync] Releasing lock…")
-    _api(
-        "POST",
-        f"{api_url}/lock/release",
-        json={"owner_token": owner_token},
+    upload_and_commit_world(
+        api_url=api_url,
+        owner_token=owner_token,
+        world_dir=world_dir,
+        release=True,
     )
-    _clear_session(world_dir)
     print("[world_sync] Done.")
-
-
-# ---------------------------------------------------------------------------
-# Session persistence (owner_token stored next to world dir)
-# ---------------------------------------------------------------------------
 
 
 def _session_file(world_dir: Path) -> Path:
@@ -271,11 +286,6 @@ def _load_session(world_dir: Path) -> Optional[str]:
 
 def _clear_session(world_dir: Path) -> None:
     _session_file(world_dir).unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:

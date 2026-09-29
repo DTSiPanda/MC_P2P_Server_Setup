@@ -167,13 +167,19 @@ def is_tailscale_logged_in() -> bool:
 
 
 def launch_tailscale_login() -> bool:
-    """Run `tailscale login` to prompt browser sign-in."""
+    """Run `tailscale up` / `tailscale login` to connect and prompt browser sign-in."""
     from client.lan_sniffer import find_tailscale_cli
     try:
         cli = find_tailscale_cli() or "tailscale"
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        subprocess.Popen([cli, "login"], creationflags=flags)
+        subprocess.Popen([cli, "up"], creationflags=flags)
         return True
     except Exception:
-        return False
+        try:
+            cli = find_tailscale_cli() or "tailscale"
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.Popen([cli, "login"], creationflags=flags)
+            return True
+        except Exception:
+            return False
 

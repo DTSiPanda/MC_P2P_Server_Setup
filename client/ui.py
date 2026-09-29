@@ -302,17 +302,29 @@ class AppUI(tk.Tk):
         self.lbl_hub_status = ttk.Label(f_status, text="Status: Ready", style="Status.TLabel")
         self.lbl_hub_status.pack(side=tk.RIGHT)
 
+        def do_ts_connect():
+            self.log("[tailscale] Launching Tailscale login...")
+            if not launch_tailscale_login():
+                messagebox.showinfo(
+                    "Tailscale Login",
+                    "Please open Tailscale from your system tray (near Windows clock) and click 'Log in' or 'Connect'."
+                )
+
+        btn_ts_login = ttk.Button(f_status, text="🔌 Connect Tailscale", command=do_ts_connect)
+
         def update_tailscale_display():
             try:
                 ip = get_tailscale_ip()
                 if ip:
                     self.lbl_ts_status.configure(text=f"Tailscale IP: {ip}", foreground="#06d6a0")
+                    btn_ts_login.pack_forget()
                 else:
                     self.lbl_ts_status.configure(text="Tailscale: Not detected", foreground="#ffb703")
+                    btn_ts_login.pack(side=tk.LEFT, padx=8)
             except Exception:
                 pass
             if self.frame_main.winfo_ismapped():
-                self.after(4000, update_tailscale_display)
+                self.after(3000, update_tailscale_display)
 
         update_tailscale_display()
 

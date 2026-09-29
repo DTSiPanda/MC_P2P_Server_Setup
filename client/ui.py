@@ -1,0 +1,469 @@
+"""
+ui.py – Modern Desktop GUI for Rotating-Host Minecraft P2P App.
+
+Features:
+- Onboarding Wizard: asks for app invite code, email, display name,
+  triggers Tailscale invite, polls status, and stores API token.
+- Main Dashboard:
+  - One-click 'Host World' (starts lock, download, TLauncher, sniffing, heartbeat).
+  - One-click 'Join World' (writes servers.dat, opens multiplayer).
+  - Status banner & live scrolling log console.
+- Admin Panel (accessible via admin button or Ctrl+Shift+A):
+  - Generate single-use invite codes.
+  - View players & Tailscale slot usage (X/6).
+  - Revoke player access.
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox, simpledialog, ttk
+from tkinter.scrolledtext import ScrolledText
+from typing import Optional
+
+from client.admin import AdminClient, get_admin_secret, save_admin_secret
+from client.api_client import APIClient, APIError, check_compatibility
+from client.auth import (
+    clear_api_token,
+    get_api_token,
+    is_tailscale_logged_in,
+    join_network,
+    launch_tailscale_login,
+    poll_join_status,
+)
+from client.guest_connect import cmd_join
+from client.host_session import run_host_session
+from client.lan_sniffer import get_tailscale_ip
+
+# Default Render API URL
+DEFAULT_API_URL = os.getenv("API_URL", "https://mc-p2p-server-setup.onrender.com")
+
+# Default world folder in TLauncher / Minecraft saves
+_APPDATA = Path(os.environ.get("APPDATA", Path.home()))
+DEFAULT_WORLD_DIR = _APPDATA / ".tlauncher" / "minecraft" / "saves" / "OurWorld"
+if not DEFAULT_WORLD_DIR.parent.exists():
+    DEFAULT_WORLD_DIR = _APPDATA / ".minecraft" / "saves" / "OurWorld"
+
+
+class AppUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Rotating-Host Minecraft P2P")
+        self.geometry("680x560")
+        self.minsize(580, 480)
+
+        self.api_url = DEFAULT_API_URL
+        self.world_dir = DEFAULT_WORLD_DIR
+        self.log_queue = queue.Queue()
+        self.host_thread: Optional[threading.Thread] = None
+        self.is_hosting = False
+
+        self._apply_theme()
+        self._build_widgets()
+
+        # Check credentials: show onboarding or main view
+        token = get_api_token()
+        if not token:
+            self.show_onboarding()
+        else:
+            self.show_main()
+
+        self.after(100, self._process_log_queue)
+        self.bind("<Control-Shift-A>", lambda e: self.open_admin_panel())
+
+    def _apply_theme(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure("TFrame", background="#1e1e24")
+        style.configure("TLabel", background="#1e1e24", foreground="#ffffff", font=("Segoe UI", 10))
+        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"), foreground="#4cc9f0")
+        style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"), foreground="#a0a0b0")
+        style.configure("Status.TLabel", font=("Segoe UI", 10, "bold"), foreground="#06d6a0")
+        style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6)
+        style.configure("Primary.TButton", background="#4361ee", foreground="#ffffff")
+        style.configure("Accent.TButton", background="#06d6a0", foreground="#000000")
+        style.configure("Danger.TButton", background="#ef476f", foreground="#ffffff")
+
+        self.configure(background="#1e1e24")
+
+    def _build_widgets(self):
+        self.container = ttk.Frame(self)
+        self.container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        # Onboarding Frame
+        self.frame_onboarding = ttk.Frame(self.container)
+
+        # Main Frame
+        self.frame_main = ttk.Frame(self.container)
+
+    def log(self, message: str):
+        self.log_queue.put(message)
+
+    def _process_log_queue(self):
+        while not self.log_queue.empty():
+            msg = self.log_queue.get_nowait()
+            if hasattr(self, "log_text"):
+                self.log_text.configure(state=tk.NORMAL)
+                self.log_text.insert(tk.END, msg + "\n")
+                self.log_text.see(tk.END)
+                self.log_text.configure(state=tk.DISABLED)
+        self.after(100, self._process_log_queue)
+
+    # -----------------------------------------------------------------------
+    # Onboarding Wizard View
+    # -----------------------------------------------------------------------
+
+    def show_onboarding(self):
+        self.frame_main.pack_forget()
+        self.frame_onboarding.pack(fill=tk.BOTH, expand=True)
+
+        for w in self.frame_onboarding.winfo_children():
+            w.destroy()
+
+        lbl_title = ttk.Label(self.frame_onboarding, text="Welcome to Shared Minecraft P2P", style="Title.TLabel")
+        lbl_title.pack(pady=(10, 8))
+
+        lbl_desc = ttk.Label(
+            self.frame_onboarding,
+            text="To join your friends' world, enter your single-use app invite code below.\n"
+                 "The app will send a Tailscale invite to your email to securely connect everyone.",
+            justify=tk.CENTER,
+        )
+        lbl_desc.pack(pady=(0, 20))
+
+        # Form fields
+        f_fields = ttk.Frame(self.frame_onboarding)
+        f_fields.pack(pady=10)
+
+        ttk.Label(f_fields, text="Invite Code:").grid(row=0, column=0, sticky=tk.W, pady=6)
+        self.entry_code = ttk.Entry(f_fields, width=28, font=("Segoe UI", 10))
+        self.entry_code.grid(row=0, column=1, pady=6, padx=8)
+
+        ttk.Label(f_fields, text="Your Email:").grid(row=1, column=0, sticky=tk.W, pady=6)
+        self.entry_email = ttk.Entry(f_fields, width=28, font=("Segoe UI", 10))
+        self.entry_email.grid(row=1, column=1, pady=6, padx=8)
+
+        ttk.Label(f_fields, text="Display Name:").grid(row=2, column=0, sticky=tk.W, pady=6)
+        self.entry_name = ttk.Entry(f_fields, width=28, font=("Segoe UI", 10))
+        self.entry_name.grid(row=2, column=1, pady=6, padx=8)
+
+        self.btn_join_submit = ttk.Button(
+            self.frame_onboarding,
+            text="Submit & Join Tailnet",
+            style="Primary.TButton",
+            command=self._on_submit_onboarding,
+        )
+        self.btn_join_submit.pack(pady=16)
+
+        self.lbl_onboarding_status = ttk.Label(self.frame_onboarding, text="", style="Status.TLabel")
+        self.lbl_onboarding_status.pack(pady=8)
+
+    def _on_submit_onboarding(self):
+        code = self.entry_code.get().strip()
+        email = self.entry_email.get().strip()
+        name = self.entry_name.get().strip()
+
+        if not code or not email or not name:
+            messagebox.showwarning("Incomplete", "Please fill in all three fields.")
+            return
+
+        self.btn_join_submit.configure(state=tk.DISABLED)
+        self.lbl_onboarding_status.configure(text="Contacting API and creating Tailscale invite...")
+
+        def worker():
+            try:
+                res = join_network(self.api_url, code, email, name)
+                invite_url = res.get("tailscale_invite_url")
+                token = res["api_token"]
+
+                self.lbl_onboarding_status.configure(
+                    text="Invite created! Checking Tailscale acceptance..."
+                )
+
+                # Prompt user with invite URL if available
+                if invite_url:
+                    import webbrowser
+                    webbrowser.open(invite_url)
+
+                # Poll status in background
+                accepted = poll_join_status(self.api_url, token, timeout=120, poll_interval=3, log=self.log)
+                if accepted:
+                    self.after(0, lambda: messagebox.showinfo("Success", "Onboarding complete! Welcome to the group."))
+                    self.after(0, self.show_main)
+                else:
+                    self.after(0, lambda: messagebox.showwarning("Notice", "Token saved! Please accept your email invite and restart the app."))
+                    self.after(0, self.show_main)
+
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Join Failed", str(exc)))
+                self.after(0, lambda: self.btn_join_submit.configure(state=tk.NORMAL))
+                self.after(0, lambda: self.lbl_onboarding_status.configure(text=""))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # Main Dashboard View
+    # -----------------------------------------------------------------------
+
+    def show_main(self):
+        self.frame_onboarding.pack_forget()
+        self.frame_main.pack(fill=tk.BOTH, expand=True)
+
+        for w in self.frame_main.winfo_children():
+            w.destroy()
+
+        # Top Bar: Title + Admin Gear
+        f_top = ttk.Frame(self.frame_main)
+        f_top.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(f_top, text="Minecraft P2P World Hub", style="Title.TLabel").pack(side=tk.LEFT)
+
+        btn_admin = ttk.Button(f_top, text="⚙ Admin", width=8, command=self.open_admin_panel)
+        btn_admin.pack(side=tk.RIGHT)
+
+        # Status Bar
+        f_status = ttk.Frame(self.frame_main)
+        f_status.pack(fill=tk.X, pady=4)
+
+        ts_ip = get_tailscale_ip()
+        ts_text = f"Tailscale IP: {ts_ip}" if ts_ip else "Tailscale: Not detected"
+        self.lbl_ts_status = ttk.Label(f_status, text=ts_text, style="Header.TLabel")
+        self.lbl_ts_status.pack(side=tk.LEFT)
+
+        self.lbl_hub_status = ttk.Label(f_status, text="Status: Ready", style="Status.TLabel")
+        self.lbl_hub_status.pack(side=tk.RIGHT)
+
+        # Action Buttons
+        f_actions = ttk.Frame(self.frame_main)
+        f_actions.pack(fill=tk.X, pady=12)
+
+        self.btn_host = ttk.Button(
+            f_actions,
+            text="🎮 Host World",
+            style="Primary.TButton",
+            command=self._on_click_host,
+        )
+        self.btn_host.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        self.btn_join = ttk.Button(
+            f_actions,
+            text="🚀 Join World",
+            style="Accent.TButton",
+            command=self._on_click_join,
+        )
+        self.btn_join.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        self.btn_copy_addr = ttk.Button(
+            f_actions,
+            text="📋 Copy Address",
+            command=self._on_click_copy_address,
+        )
+        self.btn_copy_addr.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        # Log Window
+        ttk.Label(self.frame_main, text="Session Logs:", style="Header.TLabel").pack(anchor=tk.W, pady=(8, 2))
+
+        self.log_text = ScrolledText(
+            self.frame_main,
+            height=14,
+            bg="#121216",
+            fg="#e0e0e0",
+            insertbackground="#ffffff",
+            font=("Consolas", 9),
+            state=tk.DISABLED,
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        self.log(f"[app] Connected to API: {self.api_url}")
+        self.log(f"[app] World save folder: {self.world_dir}")
+
+    # -----------------------------------------------------------------------
+    # Action Callbacks
+    # -----------------------------------------------------------------------
+
+    def _on_click_host(self):
+        token = get_api_token()
+        if not token:
+            messagebox.showerror("Error", "No API token found. Please rejoin.")
+            return
+
+        if self.is_hosting:
+            messagebox.showinfo("Hosting", "A hosting session is already running.")
+            return
+
+        self.is_hosting = True
+        self.btn_host.configure(state=tk.DISABLED)
+        self.lbl_hub_status.configure(text="Status: Hosting...", foreground="#4cc9f0")
+
+        def worker():
+            try:
+                self.world_dir.mkdir(parents=True, exist_ok=True)
+                run_host_session(
+                    api_url=self.api_url,
+                    token=token,
+                    world_dir=self.world_dir,
+                    log=self.log,
+                )
+            except Exception as exc:
+                self.log(f"[host] Session ended: {exc}")
+            finally:
+                self.is_hosting = False
+                self.after(0, lambda: self.btn_host.configure(state=tk.NORMAL))
+                self.after(0, lambda: self.lbl_hub_status.configure(text="Status: Ready", foreground="#06d6a0"))
+
+        self.host_thread = threading.Thread(target=worker, daemon=True)
+        self.host_thread.start()
+
+    def _on_click_join(self):
+        token = get_api_token()
+        if not token:
+            messagebox.showerror("Error", "No API token found.")
+            return
+
+        self.btn_join.configure(state=tk.DISABLED)
+        self.lbl_hub_status.configure(text="Status: Connecting as Guest...")
+
+        def worker():
+            try:
+                cmd_join(self.api_url, token, log=self.log)
+            except Exception as exc:
+                self.log(f"[guest] Error: {exc}")
+            finally:
+                self.after(0, lambda: self.btn_join.configure(state=tk.NORMAL))
+                self.after(0, lambda: self.lbl_hub_status.configure(text="Status: Ready", foreground="#06d6a0"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_click_copy_address(self):
+        token = get_api_token()
+        if not token:
+            return
+
+        def worker():
+            try:
+                client = APIClient(self.api_url, token)
+                host_info = client.get_host()
+                if host_info.get("hosting"):
+                    addr = f"{host_info['ip']}:{host_info['port']}"
+                    self.clipboard_clear()
+                    self.clipboard_append(addr)
+                    self.log(f"[app] Copied host address to clipboard: {addr}")
+                    self.after(0, lambda: messagebox.showinfo("Copied", f"Host address copied:\n{addr}"))
+                else:
+                    self.log("[app] Nobody is currently hosting.")
+                    self.after(0, lambda: messagebox.showinfo("Host Info", "Nobody is currently hosting."))
+            except Exception as exc:
+                self.log(f"[app] Could not fetch host: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # Admin Panel Modal
+    # -----------------------------------------------------------------------
+
+    def open_admin_panel(self):
+        secret = get_admin_secret()
+        if not secret:
+            secret = simpledialog.askstring("Admin Secret", "Enter the server ADMIN_SECRET:", show="*")
+            if not secret:
+                return
+            save_admin_secret(secret)
+
+        token = get_api_token()
+        if not token:
+            messagebox.showerror("Error", "Player API token is required.")
+            return
+
+        admin_win = tk.Toplevel(self)
+        admin_win.title("Admin Panel")
+        admin_win.geometry("520x420")
+        admin_win.configure(background="#1e1e24")
+
+        admin_client = AdminClient(self.api_url, secret, token)
+
+        lbl = ttk.Label(admin_win, text="Admin Operations", style="Title.TLabel")
+        lbl.pack(pady=12)
+
+        # Slot summary
+        lbl_slots = ttk.Label(admin_win, text="Loading slots...", style="Header.TLabel")
+        lbl_slots.pack(pady=4)
+
+        # Create Invite Code section
+        f_inv = ttk.Frame(admin_win)
+        f_inv.pack(fill=tk.X, padx=16, pady=8)
+
+        def make_invite():
+            try:
+                res = admin_client.create_invite_code(ttl_hours=48, uses=1)
+                code = res["code"]
+                messagebox.showinfo("Invite Created", f"New Invite Code:\n\n{code}\n\nCopied to clipboard.")
+                self.clipboard_clear()
+                self.clipboard_append(code)
+                refresh_players()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(f_inv, text="➕ Generate New Single-Use Invite Code", style="Primary.TButton", command=make_invite).pack(fill=tk.X)
+
+        # Players List
+        ttk.Label(admin_win, text="Active Players:", style="Header.TLabel").pack(anchor=tk.W, padx=16, pady=(10, 2))
+
+        list_box = tk.Listbox(admin_win, bg="#121216", fg="#ffffff", selectbackground="#4361ee", font=("Segoe UI", 9))
+        list_box.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+
+        player_map = {}
+
+        def refresh_players():
+            list_box.delete(0, tk.END)
+            player_map.clear()
+            try:
+                data = admin_client.list_players()
+                lbl_slots.configure(text=f"Tailscale Slots Used: {data['slots_used']} / {data['slots_max']}")
+                for idx, p in enumerate(data.get("players", [])):
+                    status_tag = "[REVOKED]" if p.get("revoked") else "[ACTIVE]"
+                    line = f"{status_tag} {p['name']} ({p.get('email', 'no email')}) ID:{p['id']}"
+                    list_box.insert(tk.END, line)
+                    player_map[idx] = p["id"]
+            except Exception as e:
+                lbl_slots.configure(text=f"Error loading players: {e}")
+
+        def revoke_selected():
+            sel = list_box.curselection()
+            if not sel:
+                messagebox.showwarning("Select Player", "Please select a player to revoke.")
+                return
+            p_id = player_map.get(sel[0])
+            if messagebox.askyesno("Confirm Revoke", f"Are you sure you want to revoke player {p_id}?"):
+                try:
+                    admin_client.revoke_player(p_id)
+                    messagebox.showinfo("Success", f"Player {p_id} revoked.")
+                    refresh_players()
+                except Exception as e:
+                    messagebox.showerror("Error", str(e))
+
+        f_bottom = ttk.Frame(admin_win)
+        f_bottom.pack(fill=tk.X, padx=16, pady=(0, 12))
+
+        ttk.Button(f_bottom, text="🔄 Refresh", command=refresh_players).pack(side=tk.LEFT, padx=4)
+        ttk.Button(f_bottom, text="🚫 Revoke Selected Player", style="Danger.TButton", command=revoke_selected).pack(side=tk.RIGHT, padx=4)
+
+        refresh_players()
+
+
+def main():
+    app = AppUI()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

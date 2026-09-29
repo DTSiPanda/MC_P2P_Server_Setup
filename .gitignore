@@ -3,5 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 dist/
+dist_installer/
 build/
-*.spec
+*.log
+!client/minecraft_p2p.spec

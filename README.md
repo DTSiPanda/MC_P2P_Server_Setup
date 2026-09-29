@@ -1,281 +1,171 @@
-# Minecraft Rotating-Host P2P
+# P2P-WorldSync: Distributed Host Coordination & State Synchronization Engine
 
-A zero-cost, serverless peer-to-peer multiplayer system for private Minecraft groups.
+> **The Big Idea:** Imagine playing on a shared Minecraft world with your friends that costs **$0/month** and doesn't rely on an expensive 24/7 paid server. Instead of the world being trapped on one person's computer, the save file lives safely in the cloud. Whoever wants to play simply clicks **"Host World"**, picks up the world "baton", and friends connect peer-to-peer with zero port forwarding or IP typing. When the host logs off, the world automatically syncs back to the cloud so the next friend can take over whenever they want.
 
-Instead of paying monthly fees for a 24/7 dedicated server, **any player in your group can host the shared world at any time**. The world "baton" is securely synchronized through Cloudflare R2 object storage, and all gameplay network traffic is routed directly peer-to-peer over an encrypted Tailscale WireGuard mesh network.
+**Under the Hood:** **P2P-WorldSync** is a decentralized, fault-tolerant game-state relay and peer-to-peer coordination architecture. It decouples persistent world state from local client compute by coupling an atomic distributed lease protocol over S3-compatible Cloudflare R2 object storage with automated Tailscale WireGuard mesh networking. By treating the hosting player as an ephemeral compute node governed by a 30-second heartbeat mutual exclusion lease, any authorized peer can dynamically acquire write authority, stream and atomically unpack authoritative world archives, capture dynamic runtime ports via UDP multicast sniffing, and establish direct peer-to-peer tunnels across Carrier-Grade NAT (CGNAT) boundaries—achieving zero-cost persistent multiplayer with zero manual port forwarding and zero ongoing server compute.
 
 ---
 
-## 🎯 The Problem & The Solution
+## 💡 The Problem & The Solution
 
-| Traditional Approach | Pain Point | Rotating-Host P2P Solution |
+| Approach | Limitations & Pain Points | P2P-WorldSync Solution |
 |---|---|---|
-| **24/7 Paid Server** (Realms, VPS) | Monthly subscription costs, idle resource waste | **$0 / month** using free-tier serverless services (Render + Cloudflare R2). |
-| **Vanilla LAN / Singleplayer** | Only the original world creator can host; world is stuck on one PC | **Any member can host**; the latest world state downloads and uploads seamlessly. |
-| **Port Forwarding / Hamachi** | CGNAT issues, firewall vulnerabilities, clunky manual IP copying | **Encrypted Tailscale mesh**; zero open router ports, direct WireGuard P2P tunnels. |
+| **24/7 Paid Server** *(Realms, VPS)* | Costs \$5–\$20/month even when idle; complex configuration and latency overhead. | **$0/month forever.** Runs on free-tier serverless infrastructure (Render + Cloudflare R2). No idle server compute. |
+| **Vanilla Singleplayer / LAN** | World save is locked to one person's hard drive; nobody can play if the creator is offline. | **Decoupled cloud world state.** The world "baton" is stored in R2. Whoever clicks **Host** downloads the latest save and plays. |
+| **Hamachi / Port Forwarding** | Router CGNAT blocks, firewall vulnerabilities, clunky VPN tools, and manual IP copy-pasting. | **Encrypted private mesh network.** Automated Tailscale WireGuard tunnels bypass CGNAT with zero router port forwarding. |
 
 ---
 
-## 🏗️ System Architecture
+## 🏗️ System Architecture & How It Works
 
 ```mermaid
 flowchart TD
     subgraph Control_Plane["Control Plane (FastAPI on Render)"]
-        API["FastAPI REST API\n(Lock Engine, Invites, Auth)"]
+        API["REST API Controller\n(Lease Engine, Invites, Auth)"]
+        LockEngine["Distributed Lease Engine\n(TTL + Nonce Verification)"]
+        API --- LockEngine
     end
 
-    subgraph Storage_Plane["Storage Plane (Cloudflare R2)"]
-        R2_Worlds[("World Zips\nworlds/<version_id>.zip")]
-        R2_State[("State Persistence\nstate/player_state.json")]
+    subgraph Storage_Plane["Storage Plane (Cloudflare R2 - S3 API)"]
+        R2_Worlds[("Versioned World Archives\nworlds/<UUID>.zip")]
+        R2_State[("Durable State Registry\nstate/player_state.json")]
     end
 
-    subgraph Network_Plane["Network Plane (Tailscale Mesh)"]
-        TS_Mesh{{"Encrypted WireGuard Mesh\n(100.x.x.x Virtual Tailnet)"}}
+    subgraph Network_Plane["Mesh Network Plane (Tailscale WireGuard)"]
+        TS_Mesh{{"Encrypted Virtual Mesh\n(100.x.y.z Subnet - CGNAT Bypass)"}}
     end
 
-    subgraph Host_Node["Host Client (Player A)"]
-        Host_UI["Desktop GUI"] --> Host_Sync["World Sync Engine"]
-        Host_Sync --> MC_Host["Minecraft LAN World\n(javaw.exe)"]
-        Host_Sniff["Multicast Sniffer\n(224.0.2.60:4445)"] -.-> MC_Host
+    subgraph Host_Peer["Host Client Node"]
+        H_App["Desktop Client"] --> H_Sync["World Sync Engine"]
+        H_Sync --> MC_Host["Minecraft LAN World\n(javaw.exe)"]
+        H_Sniff["UDP Multicast Sniffer\n(224.0.2.60:4445)"] -.-> MC_Host
     end
 
-    subgraph Guest_Node["Guest Client (Player B)"]
-        Guest_UI["Desktop GUI"] --> Guest_Join["Guest Connect Engine"]
-        Guest_Join --> Servers_Dat["Minecraft servers.dat\n(Direct NBT injection)"]
-        MC_Guest["Minecraft Client"] -.-> Servers_Dat
+    subgraph Guest_Peer["Guest Client Node"]
+        G_App["Desktop Client"] --> G_Join["Guest Connect Engine"]
+        G_Join --> G_NBT["Binary NBT Serializer\n(servers.dat Injection)"]
+        MC_Guest["Minecraft Client"] -.-> G_NBT
     end
 
-    %% Interactions
-    Host_UI -- "1. Acquire Lock (TTL + heartbeat)" --> API
-    API -- "2. Presigned Download URL" --> Host_Sync
-    Host_Sync -- "3. Download world.zip" --> R2_Worlds
-    Host_Sniff -- "4. Report IP + Port" --> API
-    Guest_UI -- "5. GET /host & /lock/status" --> API
-    Guest_Join -- "6. Connect P2P via Tailscale" --> TS_Mesh
-    MC_Guest -- "7. Direct P2P Game Traffic" --> TS_Mesh --> MC_Host
-    Host_Sync -- "8. Background Autosaves & Final Upload" --> R2_Worlds
-    API -- "9. Persist Player/Invite Registry" --> R2_State
+    %% Key Workflows
+    H_App -- "1. Acquire Lease & Get Presigned URL" --> API
+    H_Sync -- "2. Download Latest World" --> R2_Worlds
+    H_Sniff -- "3. Report LAN Port & Heartbeat" --> API
+    G_App -- "4. Query Active Host" --> API
+    G_Join -- "5. Direct P2P Game Traffic" --> TS_Mesh --> MC_Host
+    H_Sync -- "6. Background Autosaves & Final Upload" --> R2_Worlds
+    API -- "7. Persist Registry across Restarts" --> R2_State
 ```
 
----
+### Technical Pillars
 
-## 🚀 Key Features
-
-### 🔄 Rotating Host Lease & Heartbeat Engine
-- **Atomic Lock Acquisition:** Guarantees that only one player can host at a time, preventing split-brain world forks.
-- **Continuous Heartbeat:** The active host renews its lease every 30 seconds. If a host crashes or loses internet connectivity, the lease automatically expires within 90 seconds.
-- **Live UI Banner:** Real-time indicator displaying who is actively hosting, setting up, or when the server is free.
-
-### ⚡ Zero-Config Guest Joining
-- **Multicast LAN Port Detection:** Automatically listens on `224.0.2.60:4445` to capture the ephemeral port generated by Minecraft's "Open to LAN" feature.
-- **Direct NBT Injection:** Automatically injects the host's virtual Tailscale IP and port straight into Minecraft's `servers.dat` using `nbtlib`.
-- **One-Click Connect:** Guests simply click **Join World** $\rightarrow$ open Minecraft $\rightarrow$ the server is already at the very top of their Multiplayer list.
-- **Smart Auto-Retry:** If a guest attempts to connect before the host has finished launching, the app offers to automatically check every 30 seconds until the host is ready.
-
-### ☁️ Cloudflare R2 World Storage Engine
-- **Immutability by Design:** Uploads are written to unique versioned keys (`worlds/<uuid>.zip`). The "active" world pointer only advances once the SHA-256 checksum is verified.
-- **Background Autosaves:** While hosting, an independent background thread takes incremental snapshots every 10 minutes and commits them to cloud storage without interrupting gameplay.
-- **Local Conflict Prevention:** Employs SHA-256 state markers to detect offline singleplayer modifications. If local changes are detected, they are automatically preserved in a timestamped backup before syncing the cloud world.
-
-### 🛡️ State Persistence Across Cold Starts
-- **Survives Render Sleep & Redeploy:** Player registries and invite codes are serialised to `state/player_state.json` on Cloudflare R2. Even on Render's ephemeral free tier, player credentials and access tokens persist permanently.
-- **Startup World Scanning:** The API scans Cloudflare R2 upon booting up, automatically restoring the latest active world snapshot.
-
-### 👑 Admin Control Suite
-- **Single-Use App Invite Codes:** Generate secure, time-limited invite codes (e.g. `MC-XXXX`) with configurable usage limits.
-- **Tailscale Seat Management:** Monitor Tailnet user capacity (up to 6 users on the free plan) and revoke players with automatic cleanup of pending invites.
-- **Force-Release Stuck Locks:** Administrative override to break orphan or stale host locks if a player disconnected unexpectedly.
-- **Full Cloud Clear:** One-click administrative utility to wipe cloud archives and reset to a clean state.
+1. **Distributed Mutual Exclusion (Lease Protocol):** Cloud write access is protected by an in-memory lease with a 32-byte cryptographic token. The active host sends heartbeats every 30 seconds. If a host crashes or disconnects, the lease automatically expires after 90 seconds, preventing split-brain world forks.
+2. **Zero-Config P2P Discovery & CGNAT Traversal:** Peer traffic routes through an encrypted Tailscale WireGuard virtual network (`100.x.y.z`), bypassing residential CGNAT without opening firewall ports. An internal UDP multicast socket listens on `224.0.2.60:4445` to capture the random LAN port, and the client directly injects it into Minecraft's binary `servers.dat` via `nbtlib`.
+3. **Atomic Cloud Sync & Safety Backups:** Uploads write to immutable UUID keys in Cloudflare R2 (`worlds/<UUID>.zip`) and advance the pointer only after SHA-256 verification. If local singleplayer changes are detected before syncing, an automatic timestamped backup is preserved locally.
+4. **Crash-Resilient State Persistence:** To accommodate ephemeral serverless runtimes (Render free-tier sleep cycles), player tokens and invite registries are serialized to `state/player_state.json` on Cloudflare R2 and restored automatically upon cold start.
 
 ---
 
-## 🔄 Session Lifecycle Walkthrough
+## 🕹️ Quickstart: How to Play
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Host as Host Player
-    participant AppH as Host Desktop App
-    participant API as Control API (Render)
-    participant R2 as Cloudflare R2
-    participant TS as Tailscale Mesh
-    participant AppG as Guest Desktop App
-    actor Guest as Guest Player
+### 1. First-Time Setup (Once Only)
+1. Run `MinecraftP2P.exe`.
+2. Enter the single-use invite code from your server admin, your display name, and email.
+3. Click the Tailscale invite link shown on screen to join the private mesh network.
 
-    Note over Host,Guest: Step 1: Lock Acquisition & World Sync
-    Host->>AppH: Click "Host World"
-    AppH->>API: POST /lock/acquire (Authorization: Token)
-    API-->>AppH: owner_token + Presigned Download URL
-    AppH->>R2: GET world.zip
-    AppH->>AppH: Atomic unpack into Minecraft saves
+### 2. To Host the World
+1. Click **🎮 Host World**. The app syncs the newest cloud save and launches Minecraft.
+2. In Minecraft: Press `Esc` $\rightarrow$ **Open to LAN** $\rightarrow$ **Start LAN World**.
+3. The app auto-detects your port and broadcasts your connection. While you play, it automatically backs up the world to the cloud every 10 minutes.
 
-    Note over Host,Guest: Step 2: Game Launch & P2P Announcement
-    AppH->>AppH: Launch Minecraft / TLauncher
-    Host->>Host: Open World to LAN in-game
-    AppH->>AppH: Sniff multicast packet on 224.0.2.60:4445
-    AppH->>API: POST /host/address (Tailscale IP, LAN Port)
-    AppH->>API: Start periodic heartbeat (every 30s)
-
-    Note over Host,Guest: Step 3: Guest One-Click Connection
-    Guest->>AppG: Click "Join World"
-    AppG->>API: GET /host
-    API-->>AppG: { hosting: true, ip: "100.x.x.x", port: 54321 }
-    AppG->>AppG: Update servers.dat via nbtlib
-    Guest->>Guest: Open Multiplayer -> Click "OurWorld (P2P)"
-    Guest->>Host: Connect directly via Tailscale P2P WireGuard Tunnel
-
-    Note over Host,Guest: Step 4: Autosave & Session Wrap-Up
-    loop Every 10 Minutes
-        AppH->>R2: Background zip & upload autosave
-        AppH->>API: POST /world/commit (keep lock)
-    end
-
-    Host->>Host: Quit Minecraft (javaw.exe exits)
-    AppH->>R2: Final world zip upload
-    AppH->>API: POST /world/commit
-    AppH->>API: POST /lock/release
-    API-->>AppH: Lock cleared, host address reset
-```
+### 3. To Join as a Guest
+1. Check the app banner (shows **"🟢 [Host] is hosting"**).
+2. Click **🚀 Join World**.
+3. Open Minecraft $\rightarrow$ **Multiplayer** $\rightarrow$ Double-click **"OurWorld (P2P)"** at the top of your server list!
 
 ---
 
-## 🔒 Security & Privacy Model
+## ⚙️ Deployment & Compilation
 
-- **Zero Client-Side Credentials:** Sensitive infrastructure secrets (`R2_SECRET_ACCESS_KEY`, `TAILSCALE_API_KEY`, `ADMIN_SECRET`) live exclusively on the backend server.
-- **Cryptographic Token Verification:** Lock operations require ephemeral 32-byte URL-safe owner tokens verified via `secrets.compare_digest`.
-- **Constant-Time Admin Authentication:** Administrative operations are authenticated via `hmac.compare_digest` with exponential lockout throttling after repeated invalid attempts.
-- **Encrypted Mesh (WireGuard):** Gameplay network packets never traverse public ports or unencrypted tunnels. Traffic is scoped to the private `100.x.y.z` Tailnet.
-- **Scoped Presigned URLs:** Cloudflare R2 upload and download links are presigned with strict 5-minute expiries.
+### Backend Deployment (Render)
 
----
+1. Deploy this repository as a **Web Service** on [Render](https://render.com/).
+2. Set Build Command: `pip install -r server/requirements.txt`
+3. Set Start Command: `uvicorn server.main:app --host 0.0.0.0 --port $PORT`
+4. Configure Environment Variables:
 
-## 📋 System Specifications & Requirements
-
-| Component | Requirement |
+| Variable | Purpose |
 |---|---|
-| **Operating System** | Windows 10 or Windows 11 (64-bit) |
-| **Minecraft Version** | Java Edition **1.20.1** (Vanilla, Forge, Fabric, or TLauncher) |
-| **Java Runtime** | Java 17+ (64-bit) |
-| **Virtual Mesh** | [Tailscale](https://tailscale.com/) installed and authenticated |
-| **Backend Hosting** | [Render](https://render.com/) Web Service (Python 3.10+) |
-| **Object Storage** | [Cloudflare R2](https://www.cloudflare.com/products/r2/) S3-compatible bucket |
+| `ADMIN_SECRET` | Secret passphrase used to unlock the Admin Panel in the client (`Ctrl+Shift+A`). |
+| `R2_ENDPOINT_URL` | Cloudflare R2 S3 endpoint (`https://<account_id>.r2.cloudflarestorage.com`). |
+| `R2_ACCESS_KEY_ID` | Cloudflare R2 API access key. |
+| `R2_SECRET_ACCESS_KEY` | Cloudflare R2 API secret key. |
+| `R2_BUCKET_NAME` | R2 Bucket name (e.g. `minecraft-p2p`). |
+| `TAILSCALE_API_KEY` | Tailscale Personal Access Token / OAuth Client Secret. |
+| `TAILSCALE_TAILNET` | Set to `-` (default tailnet). |
+
+### Tailscale Access Control (ACL)
+In **Tailscale Admin $\rightarrow$ Access Controls**, set an open policy for peers:
+```json
+{
+  "acls": [
+    { "action": "accept", "src": ["*"], "dst": ["*:*"] }
+  ]
+}
+```
+
+### Compiling the Client Executable
+To build the standalone Windows executable from source:
+```powershell
+pip install -r client/requirements.txt
+pyinstaller --clean client/minecraft_p2p.spec
+```
+The binary will be compiled to `dist\MinecraftP2P.exe`.
 
 ---
 
-## 📂 Repository Structure
+## 📁 Repository Structure
 
 ```
 Minecraft_p2p/
-├── client/                     # Desktop GUI and Client Sync Engine
-│   ├── admin.py                # Admin CLI operations and client wrapper
-│   ├── api_client.py           # HTTP client with retry, backoff, and version validation
-│   ├── auth.py                 # Windows Credential Manager integration & token storage
-│   ├── autosave.py             # Non-blocking periodic cloud snapshot thread
-│   ├── conflict_manager.py     # Local save backup, marker tracking, and conflict resolution
-│   ├── game_launcher.py        # Launcher automation, PID detection, and exit monitoring
-│   ├── guest_connect.py        # Direct servers.dat NBT manipulation and guest join logic
-│   ├── heartbeat.py            # Background lock renewal daemon
+├── client/                     # Desktop Application & Client Sync Engine
+│   ├── admin.py                # Admin CLI suite and API operations
+│   ├── api_client.py           # HTTP client with exponential backoff & version checks
+│   ├── auth.py                 # DPAPI Windows Credential Manager integration
+│   ├── autosave.py             # Non-blocking periodic snapshot daemon
+│   ├── conflict_manager.py     # Local save state hash tracking & conflict resolution
+│   ├── game_launcher.py        # Process automation, PID detection & exit monitoring
+│   ├── guest_connect.py        # Direct servers.dat binary NBT injection & join handler
+│   ├── heartbeat.py            # Background lease renewal daemon
 │   ├── host_session.py         # End-to-end host coordinator
-│   ├── lan_sniffer.py          # Multicast UDP sniffer for Minecraft LAN announcements
+│   ├── lan_sniffer.py          # Multicast UDP packet sniffer (224.0.2.60:4445)
 │   ├── main.py                 # Client bootstrap entry point
-│   ├── minecraft_p2p.spec      # PyInstaller single-binary build configuration
+│   ├── minecraft_p2p.spec      # PyInstaller standalone build specification
 │   ├── modpack_manager.py      # Multi-instance world save path resolver
 │   ├── ui.py                   # Modern Tkinter desktop application
-│   └── world_sync.py           # World compression, SHA-256 verification, and R2 sync
+│   └── world_sync.py           # World compression, SHA-256 verification & R2 sync
 ├── server/                     # FastAPI Control Plane Backend
 │   ├── main.py                 # REST API endpoints, lock state, and rate limiters
 │   ├── r2.py                   # Cloudflare R2 S3 SDK, presigned URLs, state persistence
 │   └── tailscale.py            # Tailscale v2 REST client for automated user invites
-├── docs/                       # Architectural documentation
+├── docs/                       # Architecture & setup notes
 │   ├── packaging-and-antivirus.md
 │   └── tailscale-acl.hujson    # Tailscale ACL policy definitions
 ├── installer/                  # Packaging scripts
 │   └── setup.iss               # Inno Setup Windows installer compiler script
 ├── .env.example                # Template for server environment variables
-├── .gitignore                  # Git exclusions for Python, artifacts, logs, and secrets
+├── .gitignore                  # Exclusions for Python, artifacts, logs, and secrets
 ├── LICENSE                     # MIT Open Source License
 └── README.md                   # Project documentation
 ```
 
 ---
 
-## ⚙️ Deployment & Setup Guide
+## 📜 License & Disclaimers
 
-### 1. Backend Server Deployment (Render)
+This project is open-source software licensed under the **MIT License**. See the [LICENSE](LICENSE) file for complete details.
 
-1. Fork or clone this repository to GitHub.
-2. In [Render Dashboard](https://dashboard.render.com/), create a new **Web Service** pointing to your repository.
-3. Configure the runtime settings:
-   - **Environment:** `Python 3`
-   - **Build Command:** `pip install -r server/requirements.txt`
-   - **Start Command:** `uvicorn server.main:app --host 0.0.0.0 --port $PORT`
-4. Set the following **Environment Variables**:
-
-| Variable | Description |
-|---|---|
-| `ADMIN_SECRET` | Strong random secret string used to access the Admin Panel. |
-| `R2_ENDPOINT_URL` | Cloudflare R2 S3 endpoint URL (`https://<account_id>.r2.cloudflarestorage.com`). |
-| `R2_ACCESS_KEY_ID` | Cloudflare R2 API access key. |
-| `R2_SECRET_ACCESS_KEY` | Cloudflare R2 API secret key. |
-| `R2_BUCKET_NAME` | Name of your R2 bucket (e.g. `minecraft-p2p`). |
-| `TAILSCALE_API_KEY` | Tailscale Personal Access Token or OAuth Client secret. |
-| `TAILSCALE_TAILNET` | Set to `-` to target the default tailnet. |
-
----
-
-### 2. Tailscale ACL Configuration
-
-Navigate to **Tailscale Admin Console $\rightarrow$ Access Controls** and set an open ACL so invited members can communicate across all ports:
-
-```json
-{
-  "acls": [
-    {
-      "action": "accept",
-      "src": ["*"],
-      "dst": ["*:*"]
-    }
-  ]
-}
-```
-
----
-
-### 3. Compiling the Client Executable
-
-To compile a standalone, windowed Windows executable:
-
-```powershell
-# From the repository root
-pip install -r client/requirements.txt
-pyinstaller --clean client/minecraft_p2p.spec
-```
-
-The resulting standalone executable will be located at:
-```
-dist\MinecraftP2P.exe
-```
-
----
-
-### 4. Player Onboarding Workflow
-
-1. **Admin Generation:** The server administrator opens the app, presses `Ctrl+Shift+A` (or clicks `⚙ Admin`), authenticates with `ADMIN_SECRET`, and clicks **Generate New Invite Code**.
-2. **Player Registration:** The new player runs `MinecraftP2P.exe`, enters the invite code, display name, and email address.
-3. **Tailscale Connection:** An interactive prompt displays their personalized Tailscale invite URL. Clicking the link joins them to the private Tailnet.
-4. **Ready to Play:** The token is securely stored in the Windows Credential Manager. All subsequent launches skip onboarding and proceed directly to the Hub.
-
----
-
-## 📜 License
-
-This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for complete details.
-
----
-
-## ⚠️ Disclaimer
-
-This project is an independent tool and is not affiliated with, endorsed by, or associated with **Mojang AB**, **Microsoft Corporation**, or **TLauncher**. *Minecraft* is a registered trademark of Mojang Synergies AB.
+*Disclaimer: This project is an independent systems engineering utility and is not affiliated with, endorsed by, or associated with Mojang AB, Microsoft Corporation, or Tailscale Inc. Minecraft is a registered trademark of Mojang Synergies AB.*
 
 ---
 
@@ -287,4 +177,3 @@ This project is an independent tool and is not affiliated with, endorsed by, or 
   <a href="https://www.cloudflare.com/products/r2/"><img src="https://img.shields.io/badge/Storage-Cloudflare_R2-F38020.svg" alt="Cloudflare R2"></a>
   <a href="https://www.microsoft.com/windows"><img src="https://img.shields.io/badge/Platform-Windows_10%2F11-0078D6.svg" alt="Windows 10/11"></a>
 </p>
-

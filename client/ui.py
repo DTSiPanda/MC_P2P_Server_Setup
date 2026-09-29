@@ -306,9 +306,38 @@ class AppUI(tk.Tk):
         self.lbl_hub_status = ttk.Label(f_status, text="Status: Ready", style="Status.TLabel")
         self.lbl_hub_status.pack(side=tk.RIGHT)
 
+        # World Selection Row
+        f_world = ttk.Frame(self.frame_main)
+        f_world.pack(fill=tk.X, pady=(6, 8))
+
+        ttk.Label(f_world, text="World to Sync:").pack(side=tk.LEFT, padx=(0, 6))
+
+        saves_dir = self.world_dir.parent if self.world_dir.parent.exists() else (_APPDATA / ".minecraft" / "saves")
+        detected_worlds = [d.name for d in saves_dir.iterdir() if d.is_dir()] if saves_dir.exists() else []
+        if not detected_worlds:
+            detected_worlds = ["OurWorld"]
+        if "Frends" in detected_worlds and "OurWorld" not in detected_worlds:
+            self.world_dir = saves_dir / "Frends"
+
+        self.combo_worlds = ttk.Combobox(f_world, values=detected_worlds, font=("Segoe UI", 9), width=20)
+        default_val = self.world_dir.name if self.world_dir.name in detected_worlds else detected_worlds[0]
+        self.combo_worlds.set(default_val)
+        self.combo_worlds.pack(side=tk.LEFT, padx=4)
+
+        def on_world_change(event=None):
+            sel = self.combo_worlds.get().strip()
+            if sel:
+                self.world_dir = saves_dir / sel
+                self.log(f"[app] Selected world: {self.world_dir}")
+
+        self.combo_worlds.bind("<<ComboboxSelected>>", on_world_change)
+
+        btn_manual_upload = ttk.Button(f_world, text="☁ Upload to Cloud", command=self._on_click_manual_upload)
+        btn_manual_upload.pack(side=tk.LEFT, padx=6)
+
         # Action Buttons
         f_actions = ttk.Frame(self.frame_main)
-        f_actions.pack(fill=tk.X, pady=12)
+        f_actions.pack(fill=tk.X, pady=8)
 
         self.btn_host = ttk.Button(
             f_actions,
@@ -350,9 +379,32 @@ class AppUI(tk.Tk):
         self.log(f"[app] Connected to API: {self.api_url}")
         self.log(f"[app] World save folder: {self.world_dir}")
 
-    # -----------------------------------------------------------------------
-    # Action Callbacks
-    # -----------------------------------------------------------------------
+    def _on_click_manual_upload(self):
+        token = get_api_token()
+        if not token:
+            messagebox.showerror("Error", "No API token found.")
+            return
+
+        if not self.world_dir.exists():
+            messagebox.showerror("Missing Folder", f"World folder does not exist:\n{self.world_dir}")
+            return
+
+        self.lbl_hub_status.configure(text="Status: Uploading to Cloud...")
+
+        def worker():
+            try:
+                from client.world_sync import cmd_upload
+                self.log(f"[upload] Uploading '{self.world_dir.name}' to cloud...")
+                cmd_upload(self.api_url, token, self.world_dir)
+                self.log(f"[upload] Successfully uploaded '{self.world_dir.name}' to Cloudflare R2!")
+                self.after(0, lambda: messagebox.showinfo("Success", f"World '{self.world_dir.name}' is now live in the cloud!"))
+            except Exception as exc:
+                self.log(f"[upload] Error: {exc}")
+                self.after(0, lambda: messagebox.showerror("Upload Error", str(exc)))
+            finally:
+                self.after(0, lambda: self.lbl_hub_status.configure(text="Status: Ready", foreground="#06d6a0"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_click_host(self):
         token = get_api_token()

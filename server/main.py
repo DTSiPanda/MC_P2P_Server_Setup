@@ -43,12 +43,14 @@ def root():
 @app.on_event("startup")
 async def _startup_restore_state():
     """
-    On startup, scan R2 for existing world zips and restore _world_versions.
-    This ensures a server restart (e.g. Render cold-start) does not make the
-    server forget about the current cloud world.
+    On startup, restore both world versions and player/invite state from R2.
+    This ensures a Render cold-start, sleep/wake, or redeploy does NOT lose
+    registered players or their API tokens.
     """
+    import server.r2 as r2
+
+    # ── Restore world versions from R2 object listing ─────────────────────
     try:
-        import server.r2 as r2
         client = r2.get_client()
         paginator = client.get_paginator("list_objects_v2")
         keys: list[tuple[str, float]] = []
@@ -78,7 +80,47 @@ async def _startup_restore_state():
         else:
             logger.info("[startup] No existing world versions found in R2. Starting fresh.")
     except Exception as exc:
-        logger.warning(f"[startup] Could not restore world state from R2: {exc}")
+        logger.warning(f"[startup] Could not restore world versions from R2: {exc}")
+
+    # ── Restore player registry + invites from state/player_state.json ────
+    try:
+        state = r2.load_state()
+        if state:
+            players_loaded = 0
+            for p_data in state.get("players", []):
+                p = PlayerRecord(
+                    id=p_data["id"],
+                    name=p_data["name"],
+                    email=p_data["email"],
+                    token_hash=p_data["token_hash"],
+                    created_at=p_data["created_at"],
+                    revoked=p_data.get("revoked", False),
+                    tailscale_invite_id=p_data.get("tailscale_invite_id"),
+                )
+                _players_registry[p.id] = p
+                _token_hash_to_player_id[p.token_hash] = p.id
+                players_loaded += 1
+
+            invites_loaded = 0
+            for inv_data in state.get("invites", []):
+                inv = InviteRecord(
+                    code_hash=inv_data["code_hash"],
+                    uses_left=inv_data["uses_left"],
+                    expires_at=inv_data["expires_at"],
+                    created_at=inv_data["created_at"],
+                )
+                _invites[inv.code_hash] = inv
+                invites_loaded += 1
+
+            logger.info(
+                f"[startup] Restored {players_loaded} player(s) and "
+                f"{invites_loaded} invite(s) from R2 state."
+            )
+        else:
+            logger.info("[startup] No saved player state found — starting fresh (first run).")
+    except Exception as exc:
+        logger.warning(f"[startup] Could not restore player state from R2: {exc}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +351,54 @@ def _current_version() -> Optional[WorldVersion]:
         if v.is_current:
             return v
     return None
+
+
+def _persist_state() -> None:
+    """
+    Serialize player registry + invites to R2 (state/player_state.json).
+    Called after every mutation so state survives Render restarts.
+    Runs in a background thread to avoid blocking the request.
+    """
+    import threading as _threading
+
+    def _save():
+        try:
+            import server.r2 as r2
+            data = {
+                "players": [
+                    {
+                        "id": p.id,
+                        "name": p.name,
+                        "email": p.email,
+                        "token_hash": p.token_hash,
+                        "created_at": p.created_at,
+                        "revoked": p.revoked,
+                        "tailscale_invite_id": p.tailscale_invite_id,
+                    }
+                    for p in _players_registry.values()
+                    if p.id != "player-1"  # skip the built-in dev/default player
+                ],
+                "invites": [
+                    {
+                        "code_hash": inv.code_hash,
+                        "uses_left": inv.uses_left,
+                        "expires_at": inv.expires_at,
+                        "created_at": inv.created_at,
+                    }
+                    for inv in _invites.values()
+                ],
+            }
+            r2.save_state(data)
+            logger.info(
+                f"[state] Persisted {len(data['players'])} player(s) and "
+                f"{len(data['invites'])} invite(s) to R2."
+            )
+        except Exception as exc:
+            logger.warning(f"[state] Could not persist state to R2: {exc}")
+
+    _threading.Thread(target=_save, daemon=True).start()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +769,7 @@ def player_join(request: Request, body: JoinRequest):
     _PLAYERS[raw_token] = player.name
 
     logger.info(f"New player joined: {player.name} ({player.email}) ID={player.id}")
+    _persist_state()  # save to R2 so this player survives server restarts
 
     return JoinResponse(
         api_token=raw_token,
@@ -720,6 +811,7 @@ def admin_create_invite_code(
     _invites[code_h] = invite
 
     logger.info(f"Admin '{admin.name}' created invite code {raw_code} (uses={body.uses})")
+    _persist_state()  # save to R2 so invite survives server restarts
 
     return CreateInviteResponse(
         code=raw_code,
@@ -779,6 +871,7 @@ def admin_revoke_player(
         ts_client.delete_user_invite(player.tailscale_invite_id)
 
     logger.info(f"Admin '{admin.name}' revoked player '{player.name}' (id={player.id})")
+    _persist_state()  # save to R2 so revocation survives server restarts
 
     return RevokePlayerResponse(revoked=True, player_id=player.id)
 

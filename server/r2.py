@@ -101,3 +101,39 @@ def delete_all_worlds() -> None:
                 get_client().delete_object(Bucket=BUCKET, Key=obj["Key"])
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Player / Invite state persistence (survives Render restarts via R2)
+# ---------------------------------------------------------------------------
+
+STATE_KEY = "state/player_state.json"
+
+
+def load_state() -> "Optional[dict]":
+    """
+    Load serialised player registry + invites from R2.
+    Returns None if the state file does not exist yet.
+    """
+    import json as _json
+    try:
+        response = get_client().get_object(Bucket=BUCKET, Key=STATE_KEY)
+        return _json.loads(response["Body"].read())
+    except Exception:
+        return None
+
+
+def save_state(data: dict) -> None:
+    """
+    Persist player registry + invites to R2 as JSON.
+    Called after every mutation (join, revoke, create-invite).
+    """
+    import json as _json
+    body = _json.dumps(data, indent=2).encode("utf-8")
+    get_client().put_object(
+        Bucket=BUCKET,
+        Key=STATE_KEY,
+        Body=body,
+        ContentType="application/json",
+    )
+

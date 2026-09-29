@@ -296,13 +296,25 @@ class AppUI(tk.Tk):
         f_status = ttk.Frame(self.frame_main)
         f_status.pack(fill=tk.X, pady=4)
 
-        ts_ip = get_tailscale_ip()
-        ts_text = f"Tailscale IP: {ts_ip}" if ts_ip else "Tailscale: Not detected"
-        self.lbl_ts_status = ttk.Label(f_status, text=ts_text, style="Header.TLabel")
+        self.lbl_ts_status = ttk.Label(f_status, text="Tailscale: Checking...", style="Header.TLabel")
         self.lbl_ts_status.pack(side=tk.LEFT)
 
         self.lbl_hub_status = ttk.Label(f_status, text="Status: Ready", style="Status.TLabel")
         self.lbl_hub_status.pack(side=tk.RIGHT)
+
+        def update_tailscale_display():
+            try:
+                ip = get_tailscale_ip()
+                if ip:
+                    self.lbl_ts_status.configure(text=f"Tailscale IP: {ip}", foreground="#06d6a0")
+                else:
+                    self.lbl_ts_status.configure(text="Tailscale: Not detected", foreground="#ffb703")
+            except Exception:
+                pass
+            if self.frame_main.winfo_ismapped():
+                self.after(4000, update_tailscale_display)
+
+        update_tailscale_display()
 
         # World Selection Row
         f_world = ttk.Frame(self.frame_main)
@@ -464,6 +476,30 @@ class AppUI(tk.Tk):
         self.btn_host.configure(state=tk.DISABLED)
         self.lbl_hub_status.configure(text="Status: Hosting...", foreground="#4cc9f0")
 
+        def ask_port_gui() -> Optional[int]:
+            import tkinter.simpledialog as sd
+            res = [None]
+            ev = threading.Event()
+            def _prompt():
+                try:
+                    p = sd.askinteger(
+                        "LAN Port Entry",
+                        "Could not detect Minecraft LAN broadcast automatically.\n\n"
+                        "Please enter the port number displayed in your Minecraft chat\n"
+                        "(e.g. 'Local game hosted on port 54321'):",
+                        parent=self,
+                        minvalue=1024,
+                        maxvalue=65535,
+                    )
+                    res[0] = p
+                except Exception:
+                    pass
+                finally:
+                    ev.set()
+            self.after(0, _prompt)
+            ev.wait()
+            return res[0]
+
         def worker():
             try:
                 self.world_dir.mkdir(parents=True, exist_ok=True)
@@ -472,6 +508,7 @@ class AppUI(tk.Tk):
                     token=token,
                     world_dir=self.world_dir,
                     log=self.log,
+                    ask_port_fn=ask_port_gui,
                 )
             except (Exception, SystemExit) as exc:
                 self.log(f"[host] Session ended: {exc}")

@@ -91,6 +91,20 @@ def pack_world(world_dir: Path, out_zip: Path) -> str:
     return sha256_of_file(out_zip)
 
 
+def is_world_locked_by_game(world_dir: Path) -> bool:
+    """Return True if Minecraft has files open/locked in world_dir (e.g. session.lock)."""
+    if not world_dir.exists():
+        return False
+    session_lock = world_dir / "session.lock"
+    if session_lock.exists():
+        try:
+            with open(session_lock, "r+b"):
+                pass
+        except (PermissionError, OSError):
+            return True
+    return False
+
+
 def unpack_world(zip_path: Path, target_dir: Path) -> None:
     """
     Unpack zip_path into a temp directory, then atomically swap it into target_dir.
@@ -104,7 +118,7 @@ def unpack_world(zip_path: Path, target_dir: Path) -> None:
         if target_dir.exists():
             old_backup = parent / f"{target_dir.name}_prev"
             if old_backup.exists():
-                shutil.rmtree(old_backup)
+                shutil.rmtree(old_backup, ignore_errors=True)
             target_dir.rename(old_backup)
 
         tmp.rename(target_dir)
@@ -223,6 +237,19 @@ def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
         _save_session(world_dir, owner_token)
         return
 
+    # 1. Skip download if local world is already up-to-date with cloud version
+    marker = load_marker(world_name)
+    if marker and marker.get("version_id") == version_key and world_dir.exists():
+        print(f"[world_sync] Local world already matches cloud version ({version_key}).")
+        _save_session(world_dir, owner_token)
+        return
+
+    # 2. Skip unpack if world is currently open and locked by Minecraft
+    if is_world_locked_by_game(world_dir):
+        print("[world_sync] World is currently open in Minecraft. Proceeding with active local copy.")
+        _save_session(world_dir, owner_token)
+        return
+
     print(f"[world_sync] Downloading world ({version_key})…")
     dl = requests.get(download_url, timeout=120, stream=True)
     dl.raise_for_status()
@@ -235,6 +262,8 @@ def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
     try:
         print(f"[world_sync] Unpacking into {world_dir}…")
         unpack_world(tmp_path, world_dir)
+    except PermissionError:
+        print("[world_sync] World folder is in use by Minecraft. Proceeding with active local copy.")
     finally:
         tmp_path.unlink(missing_ok=True)
 

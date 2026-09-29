@@ -34,7 +34,7 @@ from client.world_sync import (
     upload_and_commit_world,
 )
 
-LAN_SNIFF_TIMEOUT = 120   # seconds to wait for the LAN announcement
+LAN_SNIFF_TIMEOUT = 180   # seconds to wait for the LAN announcement
 
 
 def run_host_session(
@@ -47,6 +47,7 @@ def run_host_session(
     autosave_interval: float = 600,
     tlauncher_path: Optional[Path] = None,
     log: Callable[[str], None] = print,
+    ask_port_fn: Optional[Callable[[], Optional[int]]] = None,
 ) -> None:
     """
     Run a complete host session. Blocks until the world is uploaded and the
@@ -103,13 +104,20 @@ def run_host_session(
     log("[host] Waiting for LAN announcement (open world to LAN in-game)…")
     port = sniff_port(timeout=LAN_SNIFF_TIMEOUT)
     if port is None:
-        log("[host] Port sniffing timed out.")
-        try:
-            raw = input("[host] Enter port manually: ").strip()
-            port = int(raw)
-        except (ValueError, EOFError):
-            log("[host] Invalid port or no input available. Aborting.")
-            raise RuntimeError("LAN port sniffing timed out and no manual port was provided.")
+        log("[host] LAN auto-detection timed out.")
+        if ask_port_fn is not None:
+            log("[host] Prompting for manual port entry...")
+            port = ask_port_fn()
+        else:
+            try:
+                raw = input("[host] Enter port manually: ").strip()
+                port = int(raw)
+            except Exception:
+                port = None
+
+    if port is None or not (1 <= port <= 65535):
+        log("[host] No valid LAN port available. Aborting.")
+        raise RuntimeError("LAN port sniffing timed out and no valid port was provided.")
     log(f"[host] LAN port: {port}")
 
     # ── 6.  Post host address ─────────────────────────────────────────────

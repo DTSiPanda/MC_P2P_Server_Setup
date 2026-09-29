@@ -25,7 +25,9 @@ from typing import Optional
 MULTICAST_GROUP = "224.0.2.60"
 MULTICAST_PORT = 4445
 _PORT_RE = re.compile(r"\[AD\](\d{1,5})\[/AD\]")
-DEFAULT_TIMEOUT = 60  # seconds
+import time
+
+DEFAULT_TIMEOUT = 120  # seconds
 
 
 def sniff_port(timeout: float = DEFAULT_TIMEOUT, bind_ip: str = "") -> Optional[int]:
@@ -39,14 +41,15 @@ def sniff_port(timeout: float = DEFAULT_TIMEOUT, bind_ip: str = "") -> Optional[
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.settimeout(timeout)
+        sock.settimeout(min(timeout, 2.0))
         sock.bind(("", MULTICAST_PORT))
 
         local_ip = socket.inet_aton(bind_ip if bind_ip else "0.0.0.0")
         mreq = struct.pack("4s4s", socket.inet_aton(MULTICAST_GROUP), local_ip)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-        while True:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             try:
                 data, _ = sock.recvfrom(1024)
                 message = data.decode("utf-8", errors="ignore")
@@ -56,7 +59,8 @@ def sniff_port(timeout: float = DEFAULT_TIMEOUT, bind_ip: str = "") -> Optional[
                     if 1 <= port <= 65535:
                         return port
             except socket.timeout:
-                return None
+                continue
+        return None
     finally:
         sock.close()
 
@@ -73,21 +77,62 @@ def parse_lan_announcement(message: str) -> Optional[int]:
     return None
 
 
+import os
+import shutil
+import sys
+
+def find_tailscale_cli() -> Optional[str]:
+    """Find the Tailscale CLI binary path."""
+    cli = shutil.which("tailscale")
+    if cli:
+        return cli
+    candidates = [
+        r"C:\Program Files\Tailscale\tailscale.exe",
+        r"C:\Program Files (x86)\Tailscale\tailscale.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Tailscale\tailscale.exe"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def get_tailscale_ip() -> Optional[str]:
     """
     Return this machine's Tailscale IPv4 address (100.x.x.x), or None.
-    Runs `tailscale ip --4`; Tailscale must be installed and logged in.
+    First checks active network adapters (fast, direct, no CLI required).
+    Falls back to `tailscale ip -4`.
     """
+    # 1. Fast check: network interface addresses
     try:
+        import psutil
+        for name, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if getattr(addr.family, "name", "") == "AF_INET" or addr.family == socket.AF_INET:
+                    ip = addr.address
+                    if ip.startswith("100."):
+                        parts = ip.split(".")
+                        if len(parts) == 4 and parts[1].isdigit() and 64 <= int(parts[1]) <= 127:
+                            return ip
+    except Exception:
+        pass
+
+    # 2. CLI fallback: `tailscale ip -4`
+    try:
+        cli = find_tailscale_cli() or "tailscale"
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         result = subprocess.run(
-            ["tailscale", "ip", "--4"],
+            [cli, "ip", "-4"],
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=flags,
         )
         ip = result.stdout.strip()
         if ip.startswith("100."):
             return ip
     except Exception:
         pass
+
     return None
+

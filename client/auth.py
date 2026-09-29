@@ -143,14 +143,20 @@ def poll_join_status(
 
 def is_tailscale_logged_in() -> bool:
     """
-    Check `tailscale status` locally to see if this PC is connected to Tailscale.
+    Check if this PC is connected to Tailscale.
     """
+    from client.lan_sniffer import find_tailscale_cli, get_tailscale_ip
+    if get_tailscale_ip():
+        return True
     try:
+        cli = find_tailscale_cli() or "tailscale"
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         proc = subprocess.run(
-            ["tailscale", "status", "--json"],
+            [cli, "status", "--json"],
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=flags,
         )
         if proc.returncode == 0 and "BackendState" in proc.stdout:
             # BackendState == "Running" means active and authenticated
@@ -162,8 +168,12 @@ def is_tailscale_logged_in() -> bool:
 
 def launch_tailscale_login() -> bool:
     """Run `tailscale login` to prompt browser sign-in."""
+    from client.lan_sniffer import find_tailscale_cli
     try:
-        subprocess.Popen(["tailscale", "login"])
+        cli = find_tailscale_cli() or "tailscale"
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        subprocess.Popen([cli, "login"], creationflags=flags)
         return True
     except Exception:
         return False
+

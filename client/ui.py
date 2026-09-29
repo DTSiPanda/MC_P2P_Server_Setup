@@ -163,10 +163,65 @@ class AppUI(tk.Tk):
             style="Primary.TButton",
             command=self._on_submit_onboarding,
         )
-        self.btn_join_submit.pack(pady=16)
+        self.btn_join_submit.pack(pady=12)
 
         self.lbl_onboarding_status = ttk.Label(self.frame_onboarding, text="", style="Status.TLabel")
-        self.lbl_onboarding_status.pack(pady=8)
+        self.lbl_onboarding_status.pack(pady=4)
+
+        # Host / Admin Sign-in divider & button
+        f_divider = ttk.Frame(self.frame_onboarding)
+        f_divider.pack(fill=tk.X, pady=(20, 8))
+        ttk.Separator(f_divider, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        btn_admin_login = ttk.Button(
+            self.frame_onboarding,
+            text="👑 I am the Server Host / Admin (Sign In)",
+            command=self._show_admin_login_dialog,
+        )
+        btn_admin_login.pack(pady=6)
+
+    def _show_admin_login_dialog(self):
+        """Allow the host/admin to enter their Master Token and Admin Secret directly in the UI."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Host / Admin Login")
+        dlg.geometry("450x260")
+        dlg.configure(background="#1e1e24")
+
+        ttk.Label(dlg, text="Admin Sign In", style="Title.TLabel").pack(pady=(12, 6))
+        ttk.Label(
+            dlg,
+            text="Enter the Master Player Token and Admin Secret configured on Render.",
+            justify=tk.CENTER,
+        ).pack(pady=(0, 12))
+
+        f_inputs = ttk.Frame(dlg)
+        f_inputs.pack(pady=6)
+
+        ttk.Label(f_inputs, text="Master Token (PLAYER_TOKEN):").grid(row=0, column=0, sticky=tk.W, pady=6)
+        entry_tok = ttk.Entry(f_inputs, width=28, show="*", font=("Segoe UI", 10))
+        entry_tok.grid(row=0, column=1, pady=6, padx=8)
+
+        ttk.Label(f_inputs, text="Admin Secret (ADMIN_SECRET):").grid(row=1, column=0, sticky=tk.W, pady=6)
+        entry_sec = ttk.Entry(f_inputs, width=28, show="*", font=("Segoe UI", 10))
+        entry_sec.grid(row=1, column=1, pady=6, padx=8)
+
+        def do_login():
+            tok = entry_tok.get().strip()
+            sec = entry_sec.get().strip()
+            if not tok:
+                messagebox.showwarning("Missing Token", "Please enter your PLAYER_TOKEN.", parent=dlg)
+                return
+
+            from client.auth import save_api_token
+            save_api_token(tok)
+            if sec:
+                save_admin_secret(sec)
+
+            dlg.destroy()
+            messagebox.showinfo("Success", "Host/Admin credentials saved! Loading main dashboard.", parent=self)
+            self.show_main()
+
+        ttk.Button(dlg, text="Sign In as Host", style="Primary.TButton", command=do_login).pack(pady=16)
 
     def _on_submit_onboarding(self):
         code = self.entry_code.get().strip()
@@ -229,7 +284,15 @@ class AppUI(tk.Tk):
         ttk.Label(f_top, text="Minecraft P2P World Hub", style="Title.TLabel").pack(side=tk.LEFT)
 
         btn_admin = ttk.Button(f_top, text="⚙ Admin", width=8, command=self.open_admin_panel)
-        btn_admin.pack(side=tk.RIGHT)
+        btn_admin.pack(side=tk.RIGHT, padx=4)
+
+        btn_logout = ttk.Button(f_top, text="Log Out", width=8, command=self._on_logout)
+        btn_logout.pack(side=tk.RIGHT, padx=4)
+
+    def _on_logout(self):
+        if messagebox.askyesno("Log Out", "Log out and return to the welcome screen?"):
+            clear_api_token()
+            self.show_onboarding()
 
         # Status Bar
         f_status = ttk.Frame(self.frame_main)

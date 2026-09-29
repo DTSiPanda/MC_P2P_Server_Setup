@@ -34,18 +34,17 @@ from client.api_client import APIClient, APIError, check_compatibility
 from client.auth import (
     clear_api_token,
     get_api_token,
+    get_saved_api_url,
     is_tailscale_logged_in,
     join_network,
     launch_tailscale_login,
     poll_join_status,
+    save_api_url,
 )
 from client.game_launcher import find_tlauncher, save_launcher_path
 from client.guest_connect import cmd_join
 from client.host_session import run_host_session
 from client.lan_sniffer import get_tailscale_ip
-
-# Default Render API URL
-DEFAULT_API_URL = os.getenv("API_URL", "https://mc-p2p-server-setup.onrender.com")
 
 # Default world folder in TLauncher / Minecraft saves
 _APPDATA = Path(os.environ.get("APPDATA", Path.home()))
@@ -61,7 +60,7 @@ class AppUI(tk.Tk):
         self.geometry("680x560")
         self.minsize(580, 480)
 
-        self.api_url = DEFAULT_API_URL
+        self.api_url = get_saved_api_url()
         self.world_dir = DEFAULT_WORLD_DIR
         self.log_queue = queue.Queue()
         self.host_thread: Optional[threading.Thread] = None
@@ -183,48 +182,91 @@ class AppUI(tk.Tk):
         )
         btn_admin_login.pack(pady=6)
 
+        # Server URL display & change option for custom self-hosted backends
+        def on_change_server_url():
+            new_url = simpledialog.askstring(
+                "Custom Server URL",
+                "Enter your backend server API URL:\n(Leave default if using standard setup)",
+                initialvalue=self.api_url,
+                parent=self,
+            )
+            if new_url and new_url.strip():
+                clean_url = new_url.strip().rstrip("/")
+                save_api_url(clean_url)
+                self.api_url = clean_url
+                lbl_server_endpoint.configure(text=f"Server: {self.api_url}")
+                messagebox.showinfo("Server Updated", f"Connected server set to:\n{self.api_url}", parent=self)
+
+        lbl_server_endpoint = ttk.Label(
+            self.frame_onboarding,
+            text=f"Server: {self.api_url}",
+            font=("Segoe UI", 8),
+            foreground="#606070",
+            cursor="hand2",
+        )
+        lbl_server_endpoint.pack(pady=(10, 2))
+        lbl_server_endpoint.bind("<Button-1>", lambda e: on_change_server_url())
+
     def _show_admin_login_dialog(self):
-        """Allow the host/admin to enter their Master Token and Admin Secret directly in the UI."""
+        """Allow the host/admin to enter their Server URL, Master Token, and Admin Secret directly in the UI."""
         dlg = tk.Toplevel(self)
-        dlg.title("Host / Admin Login")
-        dlg.geometry("450x260")
+        dlg.title("Host / Admin Configuration & Login")
+        dlg.geometry("520x330")
         dlg.configure(background="#1e1e24")
 
-        ttk.Label(dlg, text="Admin Sign In", style="Title.TLabel").pack(pady=(12, 6))
+        ttk.Label(dlg, text="Admin Configuration & Sign In", style="Title.TLabel").pack(pady=(12, 4))
         ttk.Label(
             dlg,
-            text="Enter the Master Player Token and Admin Secret configured on Render.",
+            text="If hosting on your own server, enter your Render/custom API URL below.\n"
+                 "Otherwise, leave default to use the standard backend.",
             justify=tk.CENTER,
-        ).pack(pady=(0, 12))
+            foreground="#a0a0b0",
+        ).pack(pady=(0, 10))
 
         f_inputs = ttk.Frame(dlg)
-        f_inputs.pack(pady=6)
+        f_inputs.pack(pady=6, padx=16)
 
-        ttk.Label(f_inputs, text="Master Token (PLAYER_TOKEN):").grid(row=0, column=0, sticky=tk.W, pady=6)
-        entry_tok = ttk.Entry(f_inputs, width=28, show="*", font=("Segoe UI", 10))
-        entry_tok.grid(row=0, column=1, pady=6, padx=8)
+        ttk.Label(f_inputs, text="Server API URL:").grid(row=0, column=0, sticky=tk.W, pady=6)
+        entry_url = ttk.Entry(f_inputs, width=32, font=("Segoe UI", 9))
+        entry_url.insert(0, self.api_url)
+        entry_url.grid(row=0, column=1, pady=6, padx=8)
 
-        ttk.Label(f_inputs, text="Admin Secret (ADMIN_SECRET):").grid(row=1, column=0, sticky=tk.W, pady=6)
-        entry_sec = ttk.Entry(f_inputs, width=28, show="*", font=("Segoe UI", 10))
-        entry_sec.grid(row=1, column=1, pady=6, padx=8)
+        ttk.Label(f_inputs, text="Master Token (PLAYER_TOKEN):").grid(row=1, column=0, sticky=tk.W, pady=6)
+        entry_tok = ttk.Entry(f_inputs, width=32, show="*", font=("Segoe UI", 9))
+        entry_tok.grid(row=1, column=1, pady=6, padx=8)
+
+        ttk.Label(f_inputs, text="Admin Secret (ADMIN_SECRET):").grid(row=2, column=0, sticky=tk.W, pady=6)
+        entry_sec = ttk.Entry(f_inputs, width=32, show="*", font=("Segoe UI", 9))
+        entry_sec.grid(row=2, column=1, pady=6, padx=8)
 
         def do_login():
+            url = entry_url.get().strip().rstrip("/")
             tok = entry_tok.get().strip()
             sec = entry_sec.get().strip()
+
+            if not url:
+                messagebox.showwarning("Missing URL", "Please enter the server API URL.", parent=dlg)
+                return
             if not tok:
                 messagebox.showwarning("Missing Token", "Please enter your PLAYER_TOKEN.", parent=dlg)
                 return
 
-            from client.auth import save_api_token
+            save_api_url(url)
+            self.api_url = url
             save_api_token(tok)
             if sec:
                 save_admin_secret(sec)
 
             dlg.destroy()
-            messagebox.showinfo("Success", "Host/Admin credentials saved! Loading main dashboard.", parent=self)
+            messagebox.showinfo(
+                "Success",
+                f"Connected to server:\n{url}\n\nHost/Admin credentials saved!",
+                parent=self,
+            )
             self.show_main()
 
-        ttk.Button(dlg, text="Sign In as Host", style="Primary.TButton", command=do_login).pack(pady=16)
+        ttk.Button(dlg, text="Save & Sign In as Admin", style="Primary.TButton", command=do_login).pack(pady=16)
+
 
     def _on_submit_onboarding(self):
         code = self.entry_code.get().strip()
@@ -805,7 +847,36 @@ class AppUI(tk.Tk):
         admin_client = AdminClient(self.api_url, secret, token)
 
         lbl = ttk.Label(admin_win, text="Admin Control Panel", style="Title.TLabel")
-        lbl.pack(pady=(12, 4))
+        lbl.pack(pady=(12, 2))
+
+        f_target_srv = ttk.Frame(admin_win)
+        f_target_srv.pack(fill=tk.X, padx=16, pady=(0, 6))
+
+        lbl_target_srv = ttk.Label(
+            f_target_srv,
+            text=f"Server: {self.api_url}",
+            font=("Segoe UI", 8),
+            foreground="#808090",
+        )
+        lbl_target_srv.pack(side=tk.LEFT)
+
+        def change_admin_server_url():
+            new_url = simpledialog.askstring(
+                "Target Server API URL",
+                "Enter custom backend server API URL:\n(e.g. https://your-app.onrender.com)",
+                initialvalue=self.api_url,
+                parent=admin_win,
+            )
+            if new_url and new_url.strip():
+                clean = new_url.strip().rstrip("/")
+                save_api_url(clean)
+                self.api_url = clean
+                lbl_target_srv.configure(text=f"Server: {self.api_url}")
+                admin_client.api_url = clean
+                messagebox.showinfo("Server Updated", f"Target server updated to:\n{clean}", parent=admin_win)
+                refresh_lock_status()
+
+        ttk.Button(f_target_srv, text="✏️ Change Server", command=change_admin_server_url).pack(side=tk.RIGHT)
 
         # -------------------------------------------------------------
         # Lock Status — always visible at the top of admin panel

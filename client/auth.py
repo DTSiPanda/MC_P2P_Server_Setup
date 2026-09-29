@@ -24,8 +24,53 @@ from client.api_client import APIClient, APIError
 
 KEYRING_SERVICE_NAME = "MinecraftP2P"
 KEYRING_USERNAME = "api_token"
+KEYRING_URL_USERNAME = "api_url"
 FALLBACK_TOKEN_DIR = Path.home() / ".minecraft_p2p"
 FALLBACK_TOKEN_FILE = FALLBACK_TOKEN_DIR / "token"
+FALLBACK_URL_FILE = FALLBACK_TOKEN_DIR / "api_url"
+
+DEFAULT_SERVER_URL = "https://mc-p2p-server-setup.onrender.com"
+
+
+def save_api_url(url: str) -> None:
+    """Save the custom API base URL in Windows Credential Manager or fallback file."""
+    clean = url.strip().rstrip("/")
+    try:
+        import keyring
+        keyring.set_password(KEYRING_SERVICE_NAME, KEYRING_URL_USERNAME, clean)
+    except Exception:
+        pass
+
+    try:
+        FALLBACK_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        FALLBACK_URL_FILE.write_text(clean, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def get_saved_api_url() -> str:
+    """Retrieve the API URL from environment, Windows Credential Manager, or fallback file."""
+    env_url = os.getenv("API_URL")
+    if env_url:
+        return env_url.strip().rstrip("/")
+
+    try:
+        import keyring
+        stored = keyring.get_password(KEYRING_SERVICE_NAME, KEYRING_URL_USERNAME)
+        if stored:
+            return stored.strip().rstrip("/")
+    except Exception:
+        pass
+
+    if FALLBACK_URL_FILE.exists():
+        try:
+            stored = FALLBACK_URL_FILE.read_text(encoding="utf-8").strip().rstrip("/")
+            if stored:
+                return stored
+        except Exception:
+            pass
+
+    return DEFAULT_SERVER_URL
 
 
 def save_api_token(token: str) -> None:

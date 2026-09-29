@@ -71,9 +71,9 @@ def run_host_session(
     # ── 1 & 2.  Download world (also acquires lock internally) ─────────────
     log("[host] Acquiring lock and downloading world…")
     try:
-        cmd_download(api_url, token, world_dir)
-    except SystemExit:
-        log("[host] Could not acquire lock or download world. Aborting.")
+        cmd_download(api_url, token, world_dir, log=log)
+    except Exception as exc:
+        log(f"[host] Failed to acquire lock or download world: {exc}")
         raise
 
     owner_token = _load_session(world_dir)

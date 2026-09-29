@@ -57,7 +57,7 @@ def _api(method: str, url: str, **kwargs) -> requests.Response:
 
 def _die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
+    raise RuntimeError(msg)
 
 
 def sha256_of_file(path: Path) -> str:
@@ -203,18 +203,23 @@ def upload_and_commit_world(
     return version_key
 
 
-def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
+def cmd_download(api_url: str, token: str, world_dir: Path, log=print) -> None:
     """Acquire lock, check conflicts, download world, unpack."""
     world_name = world_dir.name
 
     # Check local world conflict rules (Section 6A)
-    conflict = check_and_resolve_conflict(world_dir, world_name)
+    conflict = check_and_resolve_conflict(world_dir, world_name, log=log)
     if conflict == "UPLOAD_PENDING":
-        print("[world_sync] Uncommitted session detected (upload_pending=True). Retrying upload first...")
-        cmd_upload(api_url, token, world_dir)
-        print("[world_sync] Previous session successfully saved. Now proceeding with download.")
+        log("[world_sync] Uncommitted session detected (upload_pending=True). Retrying upload first...")
+        try:
+            cmd_upload(api_url, token, world_dir)
+            log("[world_sync] Previous session successfully saved. Now proceeding with download.")
+        except Exception as exc:
+            log(f"[world_sync] Note: could not auto-upload previous session ({exc}). Clearing stale state.")
+            set_upload_pending(world_name, False)
+            _clear_session(world_dir)
 
-    print("[world_sync] Acquiring lock…")
+    log("[world_sync] Acquiring lock…")
     r = _api(
         "POST",
         f"{api_url}/lock/acquire",
@@ -232,7 +237,7 @@ def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
     version_key = data.get("world_version_key")
 
     if download_url is None:
-        print("[world_sync] No world in cloud yet. Starting fresh.")
+        log("[world_sync] No world in cloud yet. Starting fresh.")
         save_marker(world_name, None, hash_world_folder(world_dir) if world_dir.exists() else None, False)
         _save_session(world_dir, owner_token)
         return
@@ -240,17 +245,17 @@ def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
     # 1. Skip download if local world is already up-to-date with cloud version
     marker = load_marker(world_name)
     if marker and marker.get("version_id") == version_key and world_dir.exists():
-        print(f"[world_sync] Local world already matches cloud version ({version_key}).")
+        log(f"[world_sync] Local world already matches cloud version ({version_key}).")
         _save_session(world_dir, owner_token)
         return
 
     # 2. Skip unpack if world is currently open and locked by Minecraft
     if is_world_locked_by_game(world_dir):
-        print("[world_sync] World is currently open in Minecraft. Proceeding with active local copy.")
+        log("[world_sync] World is currently open in Minecraft. Proceeding with active local copy.")
         _save_session(world_dir, owner_token)
         return
 
-    print(f"[world_sync] Downloading world ({version_key})…")
+    log(f"[world_sync] Downloading world ({version_key})…")
     dl = requests.get(download_url, timeout=120, stream=True)
     dl.raise_for_status()
 
@@ -260,10 +265,10 @@ def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
         tmp_path = Path(tmp.name)
 
     try:
-        print(f"[world_sync] Unpacking into {world_dir}…")
+        log(f"[world_sync] Unpacking into {world_dir}…")
         unpack_world(tmp_path, world_dir)
     except PermissionError:
-        print("[world_sync] World folder is in use by Minecraft. Proceeding with active local copy.")
+        log("[world_sync] World folder is in use by Minecraft. Proceeding with active local copy.")
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -275,27 +280,42 @@ def cmd_download(api_url: str, token: str, world_dir: Path) -> None:
         upload_pending=False,
     )
 
-    print("[world_sync] Download complete.")
+    log("[world_sync] Download complete.")
     _save_session(world_dir, owner_token)
 
 
-def cmd_upload(api_url: str, token: str, world_dir: Path) -> None:
+def cmd_upload(api_url: str, token: str, world_dir: Path, log=print) -> None:
     """Pack world, upload to R2, commit, release lock."""
     owner_token = _load_session(world_dir)
     if owner_token is None:
-        print("[world_sync] No active session – acquiring lock…")
+        log("[world_sync] No active session – acquiring lock…")
         r = _api("POST", f"{api_url}/lock/acquire", headers={"x-api-token": token})
         if r.status_code != 200:
             _die(f"lock/acquire failed: {r.status_code} {r.text}")
         owner_token = r.json()["owner_token"]
 
-    upload_and_commit_world(
-        api_url=api_url,
-        owner_token=owner_token,
-        world_dir=world_dir,
-        release=True,
-    )
-    print("[world_sync] Done.")
+    try:
+        upload_and_commit_world(
+            api_url=api_url,
+            owner_token=owner_token,
+            world_dir=world_dir,
+            release=True,
+            log=log,
+        )
+    except Exception as exc:
+        log(f"[world_sync] Upload with cached token failed: {exc}. Acquiring fresh lock…")
+        r = _api("POST", f"{api_url}/lock/acquire", headers={"x-api-token": token})
+        if r.status_code != 200:
+            _die(f"lock/acquire failed: {r.status_code} {r.text}")
+        owner_token = r.json()["owner_token"]
+        upload_and_commit_world(
+            api_url=api_url,
+            owner_token=owner_token,
+            world_dir=world_dir,
+            release=True,
+            log=log,
+        )
+    log("[world_sync] Done.")
 
 
 def _session_file(world_dir: Path) -> Path:

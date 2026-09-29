@@ -1,37 +1,40 @@
 """
-Phase 1 + Phase 2 API.
-Phase 1 – lock, heartbeat, release, host address, /host.
-Phase 2 – /config, /world/upload-url, /world/commit,
-           lock/acquire now returns a presigned download URL.
-State is kept in-memory (restart clears it; swap for a DB in production).
+Minecraft P2P API – Phase 1 through Phase 5.
+
+Phase 1 – Lock, heartbeat, release, host address, /host
+Phase 2 – /config, /world/upload-url, /world/commit, R2 storage
+Phase 5 – App invite codes, /join, Tailscale user-invites, /join/status,
+           admin endpoints (/admin/invite-code, /admin/players, /admin/revoke)
 """
 
 import hashlib
+import hmac
+import logging
 import os
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 
-app = FastAPI(title="Minecraft P2P API", version="0.2.0")
+logger = logging.getLogger("minecraft_p2p")
+
+app = FastAPI(title="Minecraft P2P API", version="0.3.0")
 
 
 @app.get("/")
 def root():
     """Health check / info."""
-    return {"status": "ok", "service": "Minecraft P2P API", "version": "0.2.0"}
+    return {"status": "ok", "service": "Minecraft P2P API", "version": "0.3.0"}
 
 
 # ---------------------------------------------------------------------------
-# In-memory state
+# In-memory state & Data Models
 # ---------------------------------------------------------------------------
 
 LOCK_TTL_SECONDS = 90  # heartbeat must arrive before this to keep the lock
-
-# Version config returned by /config
 MIN_CLIENT_VERSION = "0.1.0"
 REQUIRED_MC_VERSION = "1.20.1"
 
@@ -61,31 +64,66 @@ class WorldVersion:
 
 @dataclass
 class PendingUpload:
-    """Tracks an upload-url that was issued but not yet committed."""
     key: str
-    sha256: str       # sha256 the client declared before uploading
+    sha256: str
     size: int
     created_by: str
     issued_at: float
 
 
+@dataclass
+class PlayerRecord:
+    id: str
+    name: str
+    email: str
+    token_hash: str
+    created_at: float
+    revoked: bool = False
+    tailscale_invite_id: Optional[str] = None
+
+
+@dataclass
+class InviteRecord:
+    code_hash: str
+    uses_left: int
+    expires_at: float
+    created_at: float
+
+
 _lock = LockState()
 _host = HostState()
 _world_versions: list[WorldVersion] = []
-_pending_uploads: dict[str, PendingUpload] = {}  # key → PendingUpload
+_pending_uploads: dict[str, PendingUpload] = {}
 
-# ---------------------------------------------------------------------------
-# Fake player registry (Phase 1/2 stub; replaced in Phase 5)
-# ---------------------------------------------------------------------------
+# Player & Invite registries
+_players_registry: dict[str, PlayerRecord] = {}       # id -> PlayerRecord
+_token_hash_to_player_id: dict[str, str] = {}         # token_hash -> id
+_invites: dict[str, InviteRecord] = {}                 # code_hash -> InviteRecord
+
+# Default dev/phase1 token support & backward compatibility
 _PHASE1_TOKEN = os.getenv("PLAYER_TOKEN", "phase1-dev-token")
-
-_PLAYERS: dict[str, str] = {
-    _PHASE1_TOKEN: "player1",
-}
 
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+# Initialize default player for dev / initial token
+_default_player = PlayerRecord(
+    id="player-1",
+    name="player1",
+    email="player1@local",
+    token_hash=_hash(_PHASE1_TOKEN),
+    created_at=time.time(),
+    revoked=False,
+)
+_players_registry[_default_player.id] = _default_player
+_token_hash_to_player_id[_default_player.token_hash] = _default_player.id
+
+# _PLAYERS dictionary kept for test compatibility
+_PLAYERS: dict[str, str] = {
+    _PHASE1_TOKEN: "player1",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +131,66 @@ def _hash(value: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _get_player_record(x_api_token: str = Header(...)) -> PlayerRecord:
+    """Dependency: resolve API token → PlayerRecord, or raise 401/403."""
+    token_h = _hash(x_api_token)
+    player_id = _token_hash_to_player_id.get(token_h)
+
+    if player_id:
+        p = _players_registry.get(player_id)
+        if p is not None:
+            if p.revoked:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Player access has been revoked",
+                )
+            return p
+
+    # Check test backdoor _PLAYERS
+    if x_api_token in _PLAYERS:
+        name = _PLAYERS[x_api_token]
+        # Check if there's an existing registered player with this name
+        for p in _players_registry.values():
+            if p.name == name:
+                if p.revoked:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Player access has been revoked",
+                    )
+                return p
+        # Otherwise create an on-the-fly dummy record
+        synthetic = PlayerRecord(
+            id=f"syn-{name}",
+            name=name,
+            email=f"{name}@local",
+            token_hash=token_h,
+            created_at=time.time(),
+            revoked=False,
+        )
+        return synthetic
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API token")
+
+
 def _get_player(x_api_token: str = Header(...)) -> str:
-    """Dependency: resolve API token → player name, or raise 401."""
-    name = _PLAYERS.get(x_api_token)
-    if name is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API token")
-    return name
+    """Dependency: resolve API token → player name string, or raise 401/403."""
+    return _get_player_record(x_api_token).name
+
+
+def _verify_admin(
+    x_admin_secret: str = Header(...),
+    player: PlayerRecord = Depends(_get_player_record),
+) -> PlayerRecord:
+    """
+    Verify admin request.
+    Requires valid player token + valid x-admin-secret header.
+    Constant-time comparison via hmac.compare_digest.
+    """
+    admin_secret = os.getenv("ADMIN_SECRET", "dev-admin-secret")
+    if not hmac.compare_digest(x_admin_secret.strip().encode(), admin_secret.strip().encode()):
+        logger.warning(f"Unauthorized admin attempt by player {player.name} (id={player.id})")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin secret")
+    return player
 
 
 def _lock_is_expired() -> bool:
@@ -129,7 +221,7 @@ class LockAcquireResponse(BaseModel):
     owner_token: str
     expires_at: float
     holder_name: str
-    download_url: Optional[str] = None   # presigned GET URL; None if no world yet
+    download_url: Optional[str] = None
     world_version_key: Optional[str] = None
 
 
@@ -167,24 +259,24 @@ class ReleaseRequest(BaseModel):
 class ConfigResponse(BaseModel):
     min_client_version: str
     required_mc_version: str
-    current_world_version: Optional[str] = None   # R2 key
+    current_world_version: Optional[str] = None
 
 
 class UploadUrlRequest(BaseModel):
     owner_token: str
     size: int
-    sha256: str   # hex sha256 of the zip the client will upload
+    sha256: str
 
 
 class UploadUrlResponse(BaseModel):
-    upload_url: str   # presigned PUT URL
-    version_key: str  # the R2 key the client must PUT to
+    upload_url: str
+    version_key: str
 
 
 class CommitRequest(BaseModel):
     owner_token: str
     version_key: str
-    sha256: str   # must match what was declared in upload-url
+    sha256: str
 
 
 class CommitResponse(BaseModel):
@@ -192,18 +284,66 @@ class CommitResponse(BaseModel):
     version_key: str
 
 
+# Phase 5 Models
+class JoinRequest(BaseModel):
+    invite_code: str
+    email: str
+    display_name: str
+
+
+class JoinResponse(BaseModel):
+    api_token: str
+    player_id: str
+    tailscale_invite_url: Optional[str] = None
+
+
+class JoinStatusResponse(BaseModel):
+    accepted: bool
+    email: str
+    status: str
+
+
+class CreateInviteRequest(BaseModel):
+    ttl_hours: int = 48
+    uses: int = 1
+
+
+class CreateInviteResponse(BaseModel):
+    code: str
+    expires_at: float
+    uses_left: int
+
+
+class PlayerSummary(BaseModel):
+    id: str
+    name: str
+    email: str
+    created_at: float
+    revoked: bool
+
+
+class AdminPlayersResponse(BaseModel):
+    players: list[PlayerSummary]
+    slots_used: int
+    slots_max: int
+
+
+class RevokePlayerRequest(BaseModel):
+    player_id: str
+
+
+class RevokePlayerResponse(BaseModel):
+    revoked: bool
+    player_id: str
+
+
 # ---------------------------------------------------------------------------
-# Endpoints – Phase 1 (unchanged behaviour, lock/acquire extended)
+# Endpoints – Phase 1 & Phase 2
 # ---------------------------------------------------------------------------
 
 
 @app.post("/lock/acquire", status_code=200, response_model=LockAcquireResponse)
 def lock_acquire(player: str = Depends(_get_player)):
-    """
-    Acquire the world lock.
-    Returns 200 + owner_token + presigned download URL (if a world exists).
-    Returns 409 if another player holds a live lock.
-    """
     import server.r2 as r2
 
     now = time.time()
@@ -222,7 +362,6 @@ def lock_acquire(player: str = Depends(_get_player)):
     _lock.owner_token_hash = _hash(raw_token)
     _lock.expires_at = now + LOCK_TTL_SECONDS
 
-    # Presigned download URL for the current world version (if any)
     current = _current_version()
     download_url: Optional[str] = None
     world_version_key: Optional[str] = None
@@ -231,7 +370,7 @@ def lock_acquire(player: str = Depends(_get_player)):
             download_url = r2.presign_download(current.key)
             world_version_key = current.key
         except Exception:
-            pass  # R2 not configured locally; the client handles None gracefully
+            pass
 
     return LockAcquireResponse(
         owner_token=raw_token,
@@ -244,7 +383,6 @@ def lock_acquire(player: str = Depends(_get_player)):
 
 @app.post("/lock/heartbeat")
 def lock_heartbeat(body: HeartbeatRequest):
-    """Extend the lock TTL. Returns 410 if the lock was lost or expired."""
     _verify_owner_token(body.owner_token)
     _lock.expires_at = time.time() + LOCK_TTL_SECONDS
     return HeartbeatResponse(expires_at=_lock.expires_at)
@@ -252,7 +390,6 @@ def lock_heartbeat(body: HeartbeatRequest):
 
 @app.post("/lock/release", status_code=200)
 def lock_release(body: ReleaseRequest):
-    """Release the lock and clear the host address."""
     _verify_owner_token(body.owner_token)
 
     _lock.holder_name = None
@@ -269,7 +406,6 @@ def lock_release(body: ReleaseRequest):
 
 @app.post("/host/address", status_code=200)
 def set_host_address(body: HostAddressRequest):
-    """Store the current host's Tailscale IP and port."""
     _verify_owner_token(body.owner_token)
 
     _host.ip = body.tailscale_ip
@@ -282,7 +418,6 @@ def set_host_address(body: HostAddressRequest):
 
 @app.get("/host", response_model=HostResponse)
 def get_host(player: str = Depends(_get_player)):
-    """Return the current host's address, or {hosting: false}."""
     if _host.ip is None or _lock_is_expired():
         return HostResponse(hosting=False)
 
@@ -295,14 +430,8 @@ def get_host(player: str = Depends(_get_player)):
     )
 
 
-# ---------------------------------------------------------------------------
-# Endpoints – Phase 2
-# ---------------------------------------------------------------------------
-
-
 @app.get("/config", response_model=ConfigResponse)
 def get_config(player: str = Depends(_get_player)):
-    """Return versioning config so clients can enforce compatibility."""
     current = _current_version()
     return ConfigResponse(
         min_client_version=MIN_CLIENT_VERSION,
@@ -313,11 +442,6 @@ def get_config(player: str = Depends(_get_player)):
 
 @app.post("/world/upload-url", response_model=UploadUrlResponse)
 def world_upload_url(body: UploadUrlRequest):
-    """
-    Issue a presigned PUT URL for a new world version.
-    The caller must be the lock holder.
-    The sha256 declared here is later verified at /world/commit.
-    """
     import server.r2 as r2
 
     _verify_owner_token(body.owner_token)
@@ -338,15 +462,6 @@ def world_upload_url(body: UploadUrlRequest):
 
 @app.post("/world/commit", response_model=CommitResponse)
 def world_commit(body: CommitRequest):
-    """
-    Verify the upload and move the 'current' pointer.
-
-    Rejects if:
-    - wrong owner token
-    - version_key was never registered via /world/upload-url
-    - sha256 doesn't match what was declared at upload-url time
-    - the object doesn't exist in R2
-    """
     import server.r2 as r2
 
     _verify_owner_token(body.owner_token)
@@ -370,7 +485,6 @@ def world_commit(body: CommitRequest):
             detail="Object not found in R2; upload did not complete",
         )
 
-    # Mark all previous versions non-current, add new current version
     for v in _world_versions:
         v.is_current = False
 
@@ -383,12 +497,189 @@ def world_commit(body: CommitRequest):
         is_current=True,
     )
     _world_versions.append(new_version)
-
-    # Clean up pending record
     del _pending_uploads[body.version_key]
 
-    # Prune old versions in R2 (best-effort)
     current_keys = [v.key for v in _world_versions]
     r2.prune_old_versions(current_keys)
 
     return CommitResponse(committed=True, version_key=body.version_key)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints – Phase 5 (Onboarding, Invites, Admin)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/join", response_model=JoinResponse)
+def player_join(body: JoinRequest):
+    """
+    Onboarding: verifies single-use app invite code, invites user to Tailscale tailnet,
+    creates player, and issues a persistent API token.
+    """
+    import server.tailscale as tailscale_mod
+
+    code_clean = body.invite_code.strip()
+    code_h = _hash(code_clean)
+    now = time.time()
+
+    invite = _invites.get(code_h)
+    if invite is None or invite.uses_left <= 0 or now >= invite.expires_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired invite code",
+        )
+
+    # Check Tailscale free tier cap (6 users max)
+    active_count = sum(1 for p in _players_registry.values() if not p.revoked)
+    if active_count >= 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tailnet capacity reached (maximum 6 players)",
+        )
+
+    # Decrement invite uses
+    invite.uses_left -= 1
+
+    # Request Tailscale user invite via API
+    ts_client = tailscale_mod.get_tailscale_client()
+    ts_invite = ts_client.create_user_invite(body.email.strip())
+    invite_id = ts_invite.get("id")
+    invite_url = ts_invite.get("inviteUrl")
+
+    # Generate persistent player token
+    raw_token = secrets.token_urlsafe(32)
+    token_h = _hash(raw_token)
+    player_id = secrets.token_hex(6)
+
+    player = PlayerRecord(
+        id=player_id,
+        name=body.display_name.strip(),
+        email=body.email.strip().lower(),
+        token_hash=token_h,
+        created_at=now,
+        revoked=False,
+        tailscale_invite_id=invite_id,
+    )
+    _players_registry[player_id] = player
+    _token_hash_to_player_id[token_h] = player_id
+    _PLAYERS[raw_token] = player.name
+
+    logger.info(f"New player joined: {player.name} ({player.email}) ID={player.id}")
+
+    return JoinResponse(
+        api_token=raw_token,
+        player_id=player_id,
+        tailscale_invite_url=invite_url,
+    )
+
+
+@app.get("/join/status", response_model=JoinStatusResponse)
+def player_join_status(player: PlayerRecord = Depends(_get_player_record)):
+    """
+    Poll status after /join. Reports whether the Tailscale invite was accepted
+    (the user appears in the tailnet).
+    """
+    import server.tailscale as tailscale_mod
+
+    ts_client = tailscale_mod.get_tailscale_client()
+    in_tailnet = ts_client.is_user_in_tailnet(player.email)
+
+    return JoinStatusResponse(
+        accepted=in_tailnet,
+        email=player.email,
+        status="active" if in_tailnet else "invited",
+    )
+
+
+@app.post("/admin/invite-code", response_model=CreateInviteResponse)
+def admin_create_invite_code(
+    body: CreateInviteRequest,
+    admin: PlayerRecord = Depends(_verify_admin),
+):
+    """
+    Admin only: Generate a new single-use app invite code.
+    """
+    raw_code = f"MC-{secrets.token_hex(4).upper()}"
+    code_h = _hash(raw_code)
+    now = time.time()
+    expires_at = now + (body.ttl_hours * 3600)
+
+    invite = InviteRecord(
+        code_hash=code_h,
+        uses_left=body.uses,
+        expires_at=expires_at,
+        created_at=now,
+    )
+    _invites[code_h] = invite
+
+    logger.info(f"Admin '{admin.name}' created invite code {raw_code} (uses={body.uses})")
+
+    return CreateInviteResponse(
+        code=raw_code,
+        expires_at=expires_at,
+        uses_left=body.uses,
+    )
+
+
+@app.get("/admin/players", response_model=AdminPlayersResponse)
+def admin_list_players(admin: PlayerRecord = Depends(_verify_admin)):
+    """
+    Admin only: List all players and Tailscale slot usage.
+    """
+    summaries = [
+        PlayerSummary(
+            id=p.id,
+            name=p.name,
+            email=p.email,
+            created_at=p.created_at,
+            revoked=p.revoked,
+        )
+        for p in _players_registry.values()
+    ]
+    slots_used = sum(1 for p in _players_registry.values() if not p.revoked)
+
+    return AdminPlayersResponse(
+        players=summaries,
+        slots_used=slots_used,
+        slots_max=6,
+    )
+
+
+@app.post("/admin/revoke", response_model=RevokePlayerResponse)
+def admin_revoke_player(
+    body: RevokePlayerRequest,
+    admin: PlayerRecord = Depends(_verify_admin),
+):
+    """
+    Admin only: Revoke a player's API token, delete pending Tailscale invite,
+    and release the lock if currently held by the player.
+    """
+    import server.tailscale as tailscale_mod
+
+    player = _players_registry.get(body.player_id)
+    if player is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Player '{body.player_id}' not found",
+        )
+
+    player.revoked = True
+
+    # If the revoked player currently holds the lock, immediately release it
+    if _lock.holder_name == player.name:
+        _lock.holder_name = None
+        _lock.owner_token_hash = None
+        _lock.expires_at = 0.0
+        _host.ip = None
+        _host.port = None
+        _host.host_name = None
+        _host.updated_at = None
+
+    # Delete Tailscale invite if one was pending
+    if player.tailscale_invite_id:
+        ts_client = tailscale_mod.get_tailscale_client()
+        ts_client.delete_user_invite(player.tailscale_invite_id)
+
+    logger.info(f"Admin '{admin.name}' revoked player '{player.name}' (id={player.id})")
+
+    return RevokePlayerResponse(revoked=True, player_id=player.id)

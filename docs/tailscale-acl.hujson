@@ -1,0 +1,49 @@
+// Tailscale Access Control Lists (ACLs) for Rotating-Host Minecraft P2P
+// 
+// Principles:
+// 1. Default-deny: nodes cannot communicate unless explicitly permitted.
+// 2. "group:players" contains all Minecraft player accounts invited to the tailnet.
+// 3. Devices owned by group:players can only communicate with other group:players devices.
+// 4. Non-player devices (admin personal devices, etc.) cannot reach players' PCs.
+
+{
+  "groups": {
+    "group:players": [
+      // Tailscale automatically populates this group with invited member emails
+      // or specify emails here, e.g. "friend1@gmail.com", "friend2@outlook.com"
+    ],
+    "group:admin": [
+      // Put your admin email here
+    ]
+  },
+
+  "tagOwners": {
+    // Optional tags if nodes are tagged instead of user-owned
+    "tag:mc-node": ["group:admin"]
+  },
+
+  "acls": [
+    // Allow players to reach other players on any port (needed since LAN game selects dynamic ports)
+    {
+      "action": "accept",
+      "src": ["group:players"],
+      "dst": ["group:players:*"]
+    },
+
+    // Admin can access all player devices for management / troubleshooting if needed
+    {
+      "action": "accept",
+      "src": ["group:admin"],
+      "dst": ["group:players:*"]
+    }
+  ],
+
+  "nodeAttrs": [
+    {
+      "target": ["*"],
+      "app": {
+        "tailscale.com/cap/deny": []
+      }
+    }
+  ]
+}

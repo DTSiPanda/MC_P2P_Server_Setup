@@ -90,3 +90,14 @@ def prune_old_versions(current_keys: list[str]) -> None:
             get_client().delete_object(Bucket=BUCKET, Key=key)
     except Exception:
         pass  # pruning is best-effort; never block a commit
+
+
+def delete_all_worlds() -> None:
+    """Delete all world zips in the bucket for reset."""
+    try:
+        paginator = get_client().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=BUCKET, Prefix="worlds/"):
+            for obj in page.get("Contents", []):
+                get_client().delete_object(Bucket=BUCKET, Key=obj["Key"])
+    except Exception:
+        pass

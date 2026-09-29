@@ -500,41 +500,118 @@ class AppUI(tk.Tk):
             return
 
         admin_win = tk.Toplevel(self)
-        admin_win.title("Admin Panel")
-        admin_win.geometry("520x420")
+        admin_win.title("Admin Control Panel")
+        admin_win.geometry("620x620")
         admin_win.configure(background="#1e1e24")
 
         admin_client = AdminClient(self.api_url, secret, token)
 
-        lbl = ttk.Label(admin_win, text="Admin Operations", style="Title.TLabel")
-        lbl.pack(pady=12)
+        lbl = ttk.Label(admin_win, text="Admin Control Panel", style="Title.TLabel")
+        lbl.pack(pady=(12, 4))
+
+        # -------------------------------------------------------------
+        # Section 1: Cloud World Management
+        # -------------------------------------------------------------
+        lf_world = ttk.LabelFrame(admin_win, text=" Cloud World Management ")
+        lf_world.pack(fill=tk.X, padx=16, pady=8)
+
+        lbl_curr_world = ttk.Label(lf_world, text="Current Cloud World: Checking...", font=("Segoe UI", 9))
+        lbl_curr_world.pack(anchor=tk.W, padx=8, pady=(6, 2))
+
+        # Dropdown to choose which local world to set/upload
+        f_pick = ttk.Frame(lf_world)
+        f_pick.pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Label(f_pick, text="Select Local World:").pack(side=tk.LEFT, padx=(0, 6))
+
+        saves_dir = self.world_dir.parent if self.world_dir.parent.exists() else (_APPDATA / ".minecraft" / "saves")
+        local_saves = [d.name for d in saves_dir.iterdir() if d.is_dir()] if saves_dir.exists() else ["OurWorld"]
+        combo_admin_world = ttk.Combobox(f_pick, values=local_saves, width=18, font=("Segoe UI", 9))
+        combo_admin_world.set(self.world_dir.name if self.world_dir.name in local_saves else local_saves[0])
+        combo_admin_world.pack(side=tk.LEFT, padx=4)
+
+        def do_set_world():
+            target_name = combo_admin_world.get().strip()
+            target_path = saves_dir / target_name
+            if not target_path.exists():
+                messagebox.showerror("Error", f"World folder does not exist:\n{target_path}", parent=admin_win)
+                return
+
+            if messagebox.askyesno("Confirm Set World", f"Upload '{target_name}' and make it the active cloud world for all players?", parent=admin_win):
+                try:
+                    from client.world_sync import cmd_upload
+                    self.log(f"[admin] Uploading '{target_name}' as active cloud world...")
+                    cmd_upload(self.api_url, token, target_path)
+                    self.world_dir = target_path
+                    self.combo_worlds.set(target_name)
+                    messagebox.showinfo("Success", f"World '{target_name}' is now the active cloud world!", parent=admin_win)
+                    refresh_world_status()
+                except Exception as e:
+                    messagebox.showerror("Upload Error", str(e), parent=admin_win)
+
+        ttk.Button(f_pick, text="📤 Set as Active World", style="Primary.TButton", command=do_set_world).pack(side=tk.LEFT, padx=6)
+
+        def do_reset_world():
+            if messagebox.askyesno(
+                "Confirm Delete / Reset",
+                "Are you sure you want to DELETE the cloud world?\n\n"
+                "This will wipe all cloud backups and reset the server to 'fresh world' state.\n"
+                "(Your local saves on your PC will NOT be deleted).",
+                parent=admin_win,
+            ):
+                try:
+                    admin_client.reset_world()
+                    self.log("[admin] Cloud world wiped and reset by admin.")
+                    messagebox.showinfo("Reset Complete", "The cloud world has been wiped and reset.", parent=admin_win)
+                    refresh_world_status()
+                except Exception as e:
+                    messagebox.showerror("Reset Error", str(e), parent=admin_win)
+
+        ttk.Button(lf_world, text="🗑️ Delete / Reset Cloud World", style="Danger.TButton", command=do_reset_world).pack(anchor=tk.E, padx=8, pady=(4, 8))
+
+        def refresh_world_status():
+            try:
+                client = APIClient(self.api_url, token)
+                cfg = client.get_config()
+                cw = cfg.get("current_world_version")
+                if cw:
+                    lbl_curr_world.configure(text=f"Current Cloud World: {cw}", foreground="#4cc9f0")
+                else:
+                    lbl_curr_world.configure(text="Current Cloud World: None (Fresh setup)", foreground="#f72585")
+            except Exception as e:
+                lbl_curr_world.configure(text=f"Error checking world: {e}")
+
+        # -------------------------------------------------------------
+        # Section 2: Player & Access Management
+        # -------------------------------------------------------------
+        lf_players = ttk.LabelFrame(admin_win, text=" Access Control & Invites ")
+        lf_players.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
 
         # Slot summary
-        lbl_slots = ttk.Label(admin_win, text="Loading slots...", style="Header.TLabel")
-        lbl_slots.pack(pady=4)
-
-        # Create Invite Code section
-        f_inv = ttk.Frame(admin_win)
-        f_inv.pack(fill=tk.X, padx=16, pady=8)
+        lbl_slots = ttk.Label(lf_players, text="Loading slots...", style="Header.TLabel")
+        lbl_slots.pack(anchor=tk.W, padx=8, pady=(4, 2))
 
         def make_invite():
             try:
                 res = admin_client.create_invite_code(ttl_hours=48, uses=1)
                 code = res["code"]
-                messagebox.showinfo("Invite Created", f"New Invite Code:\n\n{code}\n\nCopied to clipboard.")
                 self.clipboard_clear()
                 self.clipboard_append(code)
+                messagebox.showinfo(
+                    "Invite Created",
+                    f"New Invite Code Generated:\n\n{code}\n\n(Copied to your clipboard!)",
+                    parent=admin_win,
+                )
                 refresh_players()
             except Exception as e:
-                messagebox.showerror("Error", str(e))
+                messagebox.showerror("Error", str(e), parent=admin_win)
 
-        ttk.Button(f_inv, text="➕ Generate New Single-Use Invite Code", style="Primary.TButton", command=make_invite).pack(fill=tk.X)
+        ttk.Button(lf_players, text="➕ Generate New Single-Use Invite Code", style="Primary.TButton", command=make_invite).pack(fill=tk.X, padx=8, pady=4)
 
-        # Players List
-        ttk.Label(admin_win, text="Active Players:", style="Header.TLabel").pack(anchor=tk.W, padx=16, pady=(10, 2))
+        ttk.Label(lf_players, text="Registered Players:").pack(anchor=tk.W, padx=8, pady=(6, 2))
 
-        list_box = tk.Listbox(admin_win, bg="#121216", fg="#ffffff", selectbackground="#4361ee", font=("Segoe UI", 9))
-        list_box.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        list_box = tk.Listbox(lf_players, bg="#121216", fg="#ffffff", selectbackground="#4361ee", font=("Segoe UI", 9), height=7)
+        list_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
 
         player_map = {}
 
@@ -546,7 +623,7 @@ class AppUI(tk.Tk):
                 lbl_slots.configure(text=f"Tailscale Slots Used: {data['slots_used']} / {data['slots_max']}")
                 for idx, p in enumerate(data.get("players", [])):
                     status_tag = "[REVOKED]" if p.get("revoked") else "[ACTIVE]"
-                    line = f"{status_tag} {p['name']} ({p.get('email', 'no email')}) ID:{p['id']}"
+                    line = f"{status_tag} {p['name']} ({p.get('email', 'no email')})  ID: {p['id']}"
                     list_box.insert(tk.END, line)
                     player_map[idx] = p["id"]
             except Exception as e:
@@ -555,23 +632,25 @@ class AppUI(tk.Tk):
         def revoke_selected():
             sel = list_box.curselection()
             if not sel:
-                messagebox.showwarning("Select Player", "Please select a player to revoke.")
+                messagebox.showwarning("Select Player", "Please select a player to revoke.", parent=admin_win)
                 return
             p_id = player_map.get(sel[0])
-            if messagebox.askyesno("Confirm Revoke", f"Are you sure you want to revoke player {p_id}?"):
+            if messagebox.askyesno("Confirm Revoke", f"Are you sure you want to revoke player {p_id}?", parent=admin_win):
                 try:
                     admin_client.revoke_player(p_id)
-                    messagebox.showinfo("Success", f"Player {p_id} revoked.")
+                    messagebox.showinfo("Success", f"Player {p_id} has been revoked.", parent=admin_win)
                     refresh_players()
                 except Exception as e:
-                    messagebox.showerror("Error", str(e))
+                    messagebox.showerror("Error", str(e), parent=admin_win)
 
-        f_bottom = ttk.Frame(admin_win)
-        f_bottom.pack(fill=tk.X, padx=16, pady=(0, 12))
+        f_bottom = ttk.Frame(lf_players)
+        f_bottom.pack(fill=tk.X, padx=8, pady=(0, 6))
 
-        ttk.Button(f_bottom, text="🔄 Refresh", command=refresh_players).pack(side=tk.LEFT, padx=4)
+        ttk.Button(f_bottom, text="🔄 Refresh", command=lambda: (refresh_players(), refresh_world_status())).pack(side=tk.LEFT, padx=4)
         ttk.Button(f_bottom, text="🚫 Revoke Selected Player", style="Danger.TButton", command=revoke_selected).pack(side=tk.RIGHT, padx=4)
 
+        # Initial data load
+        refresh_world_status()
         refresh_players()
 
 

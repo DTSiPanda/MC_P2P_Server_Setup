@@ -723,3 +723,26 @@ def admin_revoke_player(
     logger.info(f"Admin '{admin.name}' revoked player '{player.name}' (id={player.id})")
 
     return RevokePlayerResponse(revoked=True, player_id=player.id)
+
+
+@app.post("/admin/world/reset")
+def admin_reset_world(admin: PlayerRecord = Depends(_verify_admin)):
+    """Admin only: delete all cloud world archives, reset pointer to None, and clear any lock."""
+    import server.r2 as r2
+
+    r2.delete_all_worlds()
+    _world_versions.clear()
+    _pending_uploads.clear()
+
+    _lock.holder_name = None
+    _lock.owner_token_hash = None
+    _lock.expires_at = 0.0
+
+    _host.ip = None
+    _host.port = None
+    _host.host_name = None
+    _host.updated_at = None
+
+    logger.info(f"Admin '{admin.name}' wiped and reset all cloud worlds")
+
+    return {"reset": True, "current_world_version": None}

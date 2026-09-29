@@ -91,6 +91,14 @@ class AdminClient:
             raise APIError(resp.status_code, resp.text)
         return resp.json()
 
+    def reset_world(self) -> dict[str, Any]:
+        """Admin only: reset/delete the active cloud world."""
+        url = f"{self.api_url}/admin/world/reset"
+        resp = requests.post(url, headers=self._headers(), timeout=15)
+        if resp.status_code != 200:
+            raise APIError(resp.status_code, resp.text)
+        return resp.json()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minecraft P2P Admin CLI")

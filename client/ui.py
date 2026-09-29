@@ -283,16 +283,11 @@ class AppUI(tk.Tk):
 
         ttk.Label(f_top, text="Minecraft P2P World Hub", style="Title.TLabel").pack(side=tk.LEFT)
 
-        btn_admin = ttk.Button(f_top, text="⚙ Admin", width=8, command=self.open_admin_panel)
+        btn_admin = ttk.Button(f_top, text="⚙ Admin", width=10, command=self.open_admin_panel)
         btn_admin.pack(side=tk.RIGHT, padx=4)
 
-        btn_logout = ttk.Button(f_top, text="Log Out", width=8, command=self._on_logout)
+        btn_logout = ttk.Button(f_top, text="Log Out", width=10, command=self._on_logout)
         btn_logout.pack(side=tk.RIGHT, padx=4)
-
-    def _on_logout(self):
-        if messagebox.askyesno("Log Out", "Log out and return to the welcome screen?"):
-            clear_api_token()
-            self.show_onboarding()
 
         # Status Bar
         f_status = ttk.Frame(self.frame_main)
@@ -378,6 +373,11 @@ class AppUI(tk.Tk):
 
         self.log(f"[app] Connected to API: {self.api_url}")
         self.log(f"[app] World save folder: {self.world_dir}")
+
+    def _on_logout(self):
+        if messagebox.askyesno("Log Out", "Log out and return to the welcome screen?"):
+            clear_api_token()
+            self.show_onboarding()
 
     def _on_click_manual_upload(self):
         token = get_api_token()

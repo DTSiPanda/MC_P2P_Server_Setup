@@ -1,9 +1,30 @@
+# Environments & Secrets
 .env
+.env.local
+*.env
+
+# Python bytecode & cache
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
+
+# PyInstaller & Build artifacts
 dist/
 dist_installer/
 build/
-*.log
+*.spec.bak
 !client/minecraft_p2p.spec
+
+# Logs & temp files
+*.log
+*.tmp
+_world_tmp_*/
+.*_session
+
+# IDEs & OS metadata
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

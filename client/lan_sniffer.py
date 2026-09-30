@@ -97,13 +97,89 @@ def find_tailscale_cli() -> Optional[str]:
     return None
 
 
-def get_tailscale_ip() -> Optional[str]:
+def get_tailscale_status_json() -> Optional[dict]:
     """
-    Return this machine's Tailscale IPv4 address (100.x.x.x), or None.
-    First checks active network adapters (fast, direct, no CLI required).
-    Falls back to `tailscale ip -4`.
+    Run `tailscale status --json` and return the parsed JSON, or None on failure.
     """
-    # 1. Fast check: network interface addresses
+    try:
+        cli = find_tailscale_cli() or "tailscale"
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        result = subprocess.run(
+            [cli, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=flags,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            import json as _json
+            return _json.loads(result.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def get_tailscale_ip(expected_tailnet: Optional[str] = None) -> Optional[str]:
+    """
+    Return this machine's Tailscale IPv4 address (100.x.x.x) that belongs to
+    the correct shared tailnet, or None.
+
+    Why the tailnet matters:
+      A player may be a member of multiple tailnets (their own personal one +
+      the host's shared tailnet). psutil and `tailscale ip -4` return whichever
+      IP comes first — which is often the *personal* tailnet IP. If the host
+      posts their personal tailnet IP, guests on the shared tailnet cannot reach
+      it (getsockopt / connection refused errors).
+
+    Strategy:
+      1. Use `tailscale status --json` to read Self.TailscaleIPs and
+         CurrentTailnet.Name. If expected_tailnet is provided and matches the
+         current session's tailnet, return Self.TailscaleIPs[0] (the IPv4).
+         This is always the IP on the tailnet the user is currently logged into.
+      2. Fall back to psutil interface scan (fast, no CLI).
+      3. Fall back to `tailscale ip -4` CLI.
+
+    Args:
+        expected_tailnet: The tailnet name/domain the app uses (e.g.
+            "tejaspandeyshield@gmail.com" or "tail1b3de9.ts.net").
+            Pass this so the function can validate it's using the right network.
+            If None, just returns Self.TailscaleIPs[0] from status.
+    """
+    # 1. Best method: parse `tailscale status --json`
+    status = get_tailscale_status_json()
+    if status:
+        self_node = status.get("Self", {})
+        self_ips: list = self_node.get("TailscaleIPs", [])
+        current_tailnet: dict = status.get("CurrentTailnet", {})
+        tailnet_name: str = current_tailnet.get("Name", "")
+        magic_dns_suffix: str = status.get("MagicDNSSuffix", "")
+
+        # Check if this session matches the expected tailnet (if provided)
+        tailnet_matches = (
+            expected_tailnet is None
+            or expected_tailnet in tailnet_name
+            or expected_tailnet in magic_dns_suffix
+            or tailnet_name in expected_tailnet
+            or magic_dns_suffix in expected_tailnet
+        )
+
+        # Extract the IPv4 from Self.TailscaleIPs (first non-IPv6 entry)
+        for ip in self_ips:
+            if ":" not in ip and ip.startswith("100."):  # IPv4 only, skip IPv6
+                if tailnet_matches:
+                    return ip
+                else:
+                    # Tailnet mismatch — warn but still return the IP as fallback
+                    # (better than returning nothing; the caller gets to decide)
+                    import logging
+                    logging.getLogger("minecraft_p2p").warning(
+                        f"[tailscale] Current tailnet '{tailnet_name}' does not match "
+                        f"expected '{expected_tailnet}'. Using IP {ip} anyway. "
+                        f"Ask your host to share their tailnet invite so you're on the same network."
+                    )
+                    return ip
+
+    # 2. Fast fallback: network interface addresses via psutil
     try:
         import psutil
         for name, addrs in psutil.net_if_addrs().items():
@@ -117,7 +193,7 @@ def get_tailscale_ip() -> Optional[str]:
     except Exception:
         pass
 
-    # 2. CLI fallback: `tailscale ip -4`
+    # 3. CLI fallback: `tailscale ip -4`
     try:
         cli = find_tailscale_cli() or "tailscale"
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -136,3 +212,113 @@ def get_tailscale_ip() -> Optional[str]:
 
     return None
 
+
+def get_current_tailnet() -> Optional[str]:
+    """
+    Return the name of the currently active tailnet (e.g. 'tejaspandeyshield@gmail.com'),
+    or None if Tailscale is not running / status unavailable.
+    """
+    status = get_tailscale_status_json()
+    if not status:
+        return None
+    return status.get("CurrentTailnet", {}).get("Name") or None
+
+
+def switch_tailnet(tailnet_name: str) -> tuple[bool, str]:
+    """
+    Switch the active Tailscale tailnet to tailnet_name.
+
+    Returns (success: bool, error_message: str).
+    Uses `tailscale switch <tailnet_name>` under the hood.
+    The user must have previously authenticated to this tailnet
+    (which they did when they accepted the user-invite).
+    """
+    try:
+        cli = find_tailscale_cli() or "tailscale"
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        result = subprocess.run(
+            [cli, "switch", tailnet_name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=flags,
+        )
+        if result.returncode == 0:
+            return True, ""
+        err = (result.stderr or result.stdout).strip()
+        return False, err or f"tailscale switch exited with code {result.returncode}"
+    except FileNotFoundError:
+        return False, "Tailscale CLI not found. Is Tailscale installed?"
+    except subprocess.TimeoutExpired:
+        return False, "tailscale switch timed out (15s). Is Tailscale running?"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def ensure_on_tailnet(
+    expected_tailnet: str,
+    confirm_fn=None,
+    log=print,
+) -> tuple[bool, Optional[str]]:
+    """
+    Ensure the active Tailscale tailnet is expected_tailnet.
+
+    If already correct  → (True, None)  — no switch, no prompt.
+    If different tailnet → asks confirm_fn, switches if agreed.
+                         → (True, original_name) on success
+                         → (False, None) if declined or failed.
+
+    Args:
+        expected_tailnet: Tailnet name the app requires (from /tailnet-info).
+        confirm_fn:       Optional callable(current: str, expected: str) -> bool.
+                          Called by the UI to show a dialog. If None, switches silently.
+        log:              Logging callable.
+
+    Returns:
+        (ok: bool, original_tailnet: Optional[str])
+        Store original_tailnet and pass to restore_tailnet() when done.
+    """
+    current = get_current_tailnet()
+
+    if current is None:
+        log("[tailnet] Could not read current tailnet. Is Tailscale running?")
+        return False, None
+
+    if current.lower().strip() == expected_tailnet.lower().strip():
+        log(f"[tailnet] Already on correct tailnet: {current}")
+        return True, None
+
+    log(f"[tailnet] Currently on '{current}', app needs '{expected_tailnet}'.")
+
+    if confirm_fn is not None:
+        user_agreed = confirm_fn(current, expected_tailnet)
+    else:
+        user_agreed = True  # silent mode
+
+    if not user_agreed:
+        log("[tailnet] User declined tailnet switch. Aborting.")
+        return False, None
+
+    log(f"[tailnet] Switching '{current}' → '{expected_tailnet}'…")
+    ok, err = switch_tailnet(expected_tailnet)
+    if not ok:
+        log(f"[tailnet] Switch failed: {err}")
+        return False, None
+
+    log(f"[tailnet] Switched successfully. Will restore '{current}' when done.")
+    return True, current
+
+
+def restore_tailnet(original_tailnet: Optional[str], log=print) -> None:
+    """
+    Switch back to original_tailnet after the session ends.
+    Safe to call with None (no-op if user was already on the right tailnet).
+    """
+    if not original_tailnet:
+        return
+    log(f"[tailnet] Restoring your Tailscale network to '{original_tailnet}'…")
+    ok, err = switch_tailnet(original_tailnet)
+    if ok:
+        log(f"[tailnet] Restored to '{original_tailnet}'.")
+    else:
+        log(f"[tailnet] Could not restore tailnet (you may need to switch manually): {err}")

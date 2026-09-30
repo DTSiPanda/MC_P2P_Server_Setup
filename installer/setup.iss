@@ -2,7 +2,7 @@
 ; Silent installation, Tailscale installer bundling/download, shortcuts, and TLauncher detection.
 
 #define MyAppName "Minecraft Rotating-Host P2P"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Minecraft P2P Team"
 #define MyAppExeName "MinecraftP2P.exe"
 

@@ -12,21 +12,35 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 from typing import Any, Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 import requests
 
 from client.api_client import APIError
-from client.auth import get_api_token
+from client.auth import get_api_token, FALLBACK_TOKEN_DIR
 
 ADMIN_SERVICE_NAME = "MinecraftP2P_Admin"
 ADMIN_USERNAME = "admin_secret"
+FALLBACK_SECRET_FILE = FALLBACK_TOKEN_DIR / "admin_secret"
 
 
 def save_admin_secret(secret: str) -> None:
     try:
         import keyring
-        keyring.set_password(ADMIN_SERVICE_NAME, ADMIN_USERNAME, secret)
+        keyring.set_password(ADMIN_SERVICE_NAME, ADMIN_USERNAME, secret.strip())
+    except Exception:
+        pass
+
+    try:
+        FALLBACK_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        FALLBACK_SECRET_FILE.write_text(secret.strip(), encoding="utf-8")
     except Exception:
         pass
 
@@ -42,6 +56,13 @@ def get_admin_secret() -> Optional[str]:
             return secret.strip()
     except Exception:
         pass
+    if FALLBACK_SECRET_FILE.exists():
+        try:
+            stored = FALLBACK_SECRET_FILE.read_text(encoding="utf-8").strip()
+            if stored:
+                return stored
+        except Exception:
+            pass
     return None
 
 
@@ -64,7 +85,7 @@ class AdminClient:
             url,
             headers=self._headers(),
             json={"ttl_hours": ttl_hours, "uses": uses},
-            timeout=10,
+            timeout=35,
         )
         if resp.status_code != 200:
             raise APIError(resp.status_code, resp.text)
@@ -73,7 +94,7 @@ class AdminClient:
     def list_players(self) -> dict[str, Any]:
         """List all players and Tailscale slot usage."""
         url = f"{self.api_url}/admin/players"
-        resp = requests.get(url, headers=self._headers(), timeout=10)
+        resp = requests.get(url, headers=self._headers(), timeout=35)
         if resp.status_code != 200:
             raise APIError(resp.status_code, resp.text)
         return resp.json()
@@ -85,7 +106,7 @@ class AdminClient:
             url,
             headers=self._headers(),
             json={"player_id": player_id},
-            timeout=10,
+            timeout=35,
         )
         if resp.status_code != 200:
             raise APIError(resp.status_code, resp.text)
@@ -94,7 +115,7 @@ class AdminClient:
     def reset_world(self) -> dict[str, Any]:
         """Admin only: reset/delete the active cloud world."""
         url = f"{self.api_url}/admin/world/reset"
-        resp = requests.post(url, headers=self._headers(), timeout=15)
+        resp = requests.post(url, headers=self._headers(), timeout=35)
         if resp.status_code != 200:
             raise APIError(resp.status_code, resp.text)
         return resp.json()
@@ -102,10 +123,11 @@ class AdminClient:
     def force_release_lock(self) -> dict[str, Any]:
         """Admin only: forcefully release a stuck/stale lock held by any player."""
         url = f"{self.api_url}/admin/lock/force-release"
-        resp = requests.post(url, headers=self._headers(), timeout=10)
+        resp = requests.post(url, headers=self._headers(), timeout=35)
         if resp.status_code != 200:
             raise APIError(resp.status_code, resp.text)
         return resp.json()
+
 
     def cloud_clear(self) -> dict[str, Any]:
         """Admin only: wipe ALL cloud world data from R2 and reset lock + host state."""

@@ -18,7 +18,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 import requests
+
 
 from client.api_client import APIClient, APIError
 

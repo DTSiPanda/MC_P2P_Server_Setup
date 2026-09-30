@@ -105,18 +105,63 @@ def is_world_locked_by_game(world_dir: Path) -> bool:
     return False
 
 
+def clean_world_duplicates(saves_dir: Path, log=print) -> None:
+    """
+    Scan saves_dir and relocate any backup or temporary world folders
+    (*_prev, _world_tmp_*) into p2p_backups/.
+    This ensures Minecraft's Singleplayer menu never displays duplicate entries
+    like 'OurWorld (OurWorld_prev)' or unfinished '_world_tmp_...' folders.
+    """
+    if not saves_dir.exists() or not saves_dir.is_dir():
+        return
+
+    backup_dir = saves_dir.parent / "p2p_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for item in saves_dir.iterdir():
+            if not item.is_dir():
+                continue
+            name_lower = item.name.lower()
+            if name_lower.endswith("_prev") or name_lower.startswith("_world_tmp_"):
+                target_dest = backup_dir / item.name
+                try:
+                    if target_dest.exists():
+                        shutil.rmtree(target_dest, ignore_errors=True)
+                    shutil.move(str(item), str(target_dest))
+                    log(f"[cleaner] Moved duplicate world '{item.name}' out of saves into {target_dest}")
+                except Exception as exc:
+                    try:
+                        shutil.rmtree(item, ignore_errors=True)
+                        log(f"[cleaner] Removed duplicate world '{item.name}' from saves: {exc}")
+                    except Exception:
+                        pass
+    except Exception as exc:
+        log(f"[cleaner] Error during world duplicates scan: {exc}")
+
+
 def unpack_world(zip_path: Path, target_dir: Path) -> None:
     """
     Unpack zip_path into a temp directory, then atomically swap it into target_dir.
+    Backups are saved outside of the 'saves' directory so Minecraft's Singleplayer
+    menu does not list duplicate world entries.
     """
     parent = target_dir.parent
-    tmp = Path(tempfile.mkdtemp(dir=parent, prefix="_world_tmp_"))
+
+    # Clean up legacy in-saves backups and leftover temp folders
+    clean_world_duplicates(parent)
+
+    # Store backup in a dedicated p2p_backups directory alongside saves/
+    backup_dir = parent.parent / "p2p_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    old_backup = backup_dir / f"{target_dir.name}_prev"
+
+    tmp = Path(tempfile.mkdtemp(dir=backup_dir, prefix="_world_tmp_"))
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(tmp)
 
         if target_dir.exists():
-            old_backup = parent / f"{target_dir.name}_prev"
             if old_backup.exists():
                 shutil.rmtree(old_backup, ignore_errors=True)
             target_dir.rename(old_backup)
@@ -125,6 +170,8 @@ def unpack_world(zip_path: Path, target_dir: Path) -> None:
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+
+
 
 
 def upload_and_commit_world(

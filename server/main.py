@@ -121,6 +121,31 @@ async def _startup_restore_state():
     except Exception as exc:
         logger.warning(f"[startup] Could not restore player state from R2: {exc}")
 
+    # ── Auto-populate admin identity from Tailscale API ───────────────────
+    # Query the tailnet owner so we don't need ADMIN_NAME / ADMIN_EMAIL env vars.
+    # Falls back silently to whatever the env vars provided if the API call fails.
+    global _discovered_tailnet_name
+    try:
+        from server.tailscale import TailscaleClient
+        ts = TailscaleClient()
+        owner_email, owner_name = ts.get_tailnet_owner()
+        if owner_email or owner_name:
+            admin = _players_registry.get("player-1")
+            if admin:
+                if owner_email:
+                    admin.email = owner_email
+                    _discovered_tailnet_name = owner_email
+                if owner_name:
+                    admin.name = owner_name
+                _PLAYERS[_PHASE1_TOKEN] = admin.name
+                logger.info(
+                    f"[startup] Admin identity from Tailscale API: "
+                    f"{admin.name} <{admin.email}>"
+                )
+        else:
+            logger.info("[startup] Tailscale owner not found — using ADMIN_NAME/ADMIN_EMAIL env vars.")
+    except Exception as exc:
+        logger.warning(f"[startup] Could not fetch admin identity from Tailscale: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +212,7 @@ _lock = LockState()
 _host = HostState()
 _world_versions: list[WorldVersion] = []
 _pending_uploads: dict[str, PendingUpload] = {}
+_discovered_tailnet_name: Optional[str] = None
 
 # Player & Invite registries
 _players_registry: dict[str, PlayerRecord] = {}       # id -> PlayerRecord
@@ -202,16 +228,23 @@ _ADMIN_LOCKOUT_WINDOW = 300.0  # 5 minutes
 # Default dev/phase1 token support & backward compatibility
 _PHASE1_TOKEN = os.getenv("PLAYER_TOKEN", "phase1-dev-token")
 
+# Admin identity — set these in .env so the admin shows up with their real name/email
+# throughout the system (admin panel, lock holder, logs, Tailscale invites, etc.)
+# If not set, Tailscale API auto-discovers the owner at startup, or falls back to player1.
+_ADMIN_NAME  = os.getenv("ADMIN_NAME",  "player1")
+_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "player1@local")
+
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-# Initialize default player for dev / initial token
+# Initialize the admin player from environment variables.
+# The admin is always "player-1"; their name and email come from ADMIN_NAME / ADMIN_EMAIL.
 _default_player = PlayerRecord(
     id="player-1",
-    name="player1",
-    email="player1@local",
+    name=_ADMIN_NAME,
+    email=_ADMIN_EMAIL,
     token_hash=_hash(_PHASE1_TOKEN),
     created_at=time.time(),
     revoked=False,
@@ -221,7 +254,7 @@ _token_hash_to_player_id[_default_player.token_hash] = _default_player.id
 
 # _PLAYERS dictionary kept for test compatibility
 _PLAYERS: dict[str, str] = {
-    _PHASE1_TOKEN: "player1",
+    _PHASE1_TOKEN: _ADMIN_NAME,
 }
 
 
@@ -376,7 +409,10 @@ def _persist_state() -> None:
                         "tailscale_invite_id": p.tailscale_invite_id,
                     }
                     for p in _players_registry.values()
-                    if p.id != "player-1"  # skip the built-in dev/default player
+                    # Admin (player-1) is always rebuilt from ADMIN_NAME / ADMIN_EMAIL /
+                    # PLAYER_TOKEN env vars on startup — exclude from R2 so env vars
+                    # remain the authoritative source of truth for admin identity.
+                    if p.id != "player-1"
                 ],
                 "invites": [
                     {
@@ -647,6 +683,30 @@ def get_config(player: str = Depends(_get_player)):
     )
 
 
+@app.get("/tailnet-info")
+def get_tailnet_info(player: str = Depends(_get_player)):
+    """
+    Return the tailnet name/domain that all players must be on.
+    Clients use this to pick the correct Tailscale IP when a player is a
+    member of multiple tailnets (e.g., their own personal one + this app's
+    shared tailnet). Without this, the host may advertise a Tailscale IP from
+    the wrong tailnet, causing getsockopt / connection refused errors for guests.
+    """
+    tailnet = os.getenv("TAILSCALE_TAILNET", "").strip()
+    if not tailnet or tailnet == "-":
+        tailnet = _discovered_tailnet_name or ""
+        if not tailnet:
+            admin = _players_registry.get("player-1")
+            if admin and admin.email and not admin.email.endswith("@local"):
+                tailnet = admin.email
+    return {
+        "tailnet_name": tailnet,
+        "hint": (
+            "Ensure your Tailscale client is connected to this tailnet before hosting."
+        ),
+    }
+
+
 @app.post("/world/upload-url", response_model=UploadUrlResponse)
 def world_upload_url(body: UploadUrlRequest):
     import server.r2 as r2
@@ -705,6 +765,11 @@ def world_commit(body: CommitRequest):
     )
     _world_versions.append(new_version)
     del _pending_uploads[body.version_key]
+
+    # Cap retained versions in memory and R2 to the latest 5
+    MAX_KEEP_VERSIONS = 5
+    if len(_world_versions) > MAX_KEEP_VERSIONS:
+        _world_versions[:] = _world_versions[-MAX_KEEP_VERSIONS:]
 
     current_keys = [v.key for v in _world_versions]
     r2.prune_old_versions(current_keys)

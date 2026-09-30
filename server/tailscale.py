@@ -136,6 +136,32 @@ class TailscaleClient:
                 return True
         return False
 
+    def get_tailnet_owner(self) -> tuple[Optional[str], Optional[str]]:
+        """
+        Return (email, display_name) of the tailnet owner, or (None, None).
+
+        Queries GET /api/v2/tailnet/{tailnet}/users and finds the entry with
+        role == "owner". This is used at server startup to automatically populate
+        the admin player record with the real owner identity, so ADMIN_NAME and
+        ADMIN_EMAIL env vars don't need to be set manually.
+        """
+        if not self.is_configured:
+            return None, None
+        try:
+            users = self.get_users()
+            for u in users:
+                if u.get("role", "").lower() == "owner":
+                    email = u.get("loginName") or u.get("email") or None
+                    name = u.get("displayName") or u.get("name") or None
+                    return email, name
+        except Exception as exc:
+            import logging
+            logging.getLogger("minecraft_p2p").warning(
+                f"[tailscale] Could not fetch tailnet owner: {exc}"
+            )
+        return None, None
+
+
     def delete_user_invite(self, invite_id: str) -> bool:
         """Delete / revoke a pending user invite."""
         if not self.is_configured:

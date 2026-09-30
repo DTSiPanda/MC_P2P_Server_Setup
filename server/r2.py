@@ -74,8 +74,8 @@ def object_exists(key: str) -> bool:
 
 def prune_old_versions(current_keys: list[str]) -> None:
     """
-    Delete world zips not in current_keys beyond KEEP_VERSIONS.
-    Called after a successful commit.
+    Delete any objects in R2 under worlds/ that are not in current_keys.
+    Ensures storage stays bounded to the retained world versions.
     """
     try:
         paginator = get_client().get_paginator("list_objects_v2")
@@ -84,10 +84,10 @@ def prune_old_versions(current_keys: list[str]) -> None:
             for obj in page.get("Contents", []):
                 all_keys.append(obj["Key"])
 
-        # Protect current_keys; delete the oldest excess versions
-        deletable = [k for k in all_keys if k not in current_keys]
-        for key in deletable[KEEP_VERSIONS:]:
-            get_client().delete_object(Bucket=BUCKET, Key=key)
+        # Delete any key in R2 that is not in current_keys
+        for key in all_keys:
+            if key not in current_keys:
+                get_client().delete_object(Bucket=BUCKET, Key=key)
     except Exception:
         pass  # pruning is best-effort; never block a commit
 

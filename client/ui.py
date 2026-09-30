@@ -23,7 +23,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Optional
 
@@ -39,12 +39,15 @@ from client.auth import (
     join_network,
     launch_tailscale_login,
     poll_join_status,
+    save_api_token,
     save_api_url,
 )
 from client.game_launcher import find_tlauncher, save_launcher_path
 from client.guest_connect import cmd_join
 from client.host_session import run_host_session
-from client.lan_sniffer import get_tailscale_ip
+from client.lan_sniffer import get_tailscale_ip, get_current_tailnet
+from client.player_sync import detect_local_player_identity
+from client.world_sync import clean_world_duplicates
 
 # Default world folder in TLauncher / Minecraft saves
 _APPDATA = Path(os.environ.get("APPDATA", Path.home()))
@@ -52,19 +55,143 @@ DEFAULT_WORLD_DIR = _APPDATA / ".tlauncher" / "minecraft" / "saves" / "OurWorld"
 if not DEFAULT_WORLD_DIR.parent.exists():
     DEFAULT_WORLD_DIR = _APPDATA / ".minecraft" / "saves" / "OurWorld"
 
+DEFAULT_API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
+
+
+def ask_input_dialog(
+    title: str,
+    prompt: str,
+    initialvalue: str = "",
+    show: Optional[str] = None,
+    parent: Optional[tk.Tk | tk.Toplevel] = None,
+) -> Optional[str]:
+    """
+    Spacious prompt modal that opens in at least 800x600 resolution
+    matching the application dark theme.
+    """
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.geometry("800x600")
+    win.minsize(800, 600)
+    win.configure(background="#1e1e24")
+    win.grab_set()
+
+    result: list[Optional[str]] = [None]
+
+    f_content = ttk.Frame(win)
+    f_content.pack(fill=tk.BOTH, expand=True, padx=40, pady=40)
+
+    ttk.Label(f_content, text=title, style="Title.TLabel").pack(anchor=tk.W, pady=(0, 16))
+
+    ttk.Label(
+        f_content,
+        text=prompt,
+        font=("Segoe UI", 11),
+        foreground="#e0e0e0",
+        wraplength=720,
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W, pady=(0, 20))
+
+    entry = ttk.Entry(f_content, font=("Segoe UI", 12))
+    if show:
+        entry.configure(show=show)
+    entry.insert(0, initialvalue)
+    entry.pack(anchor=tk.W, fill=tk.X, pady=(0, 24))
+    entry.focus_set()
+
+    def on_ok(event=None):
+        result[0] = entry.get()
+        win.destroy()
+
+    def on_cancel(event=None):
+        result[0] = None
+        win.destroy()
+
+    entry.bind("<Return>", on_ok)
+    entry.bind("<Escape>", on_cancel)
+
+    f_btns = ttk.Frame(f_content)
+    f_btns.pack(anchor=tk.E, pady=16)
+
+    ttk.Button(f_btns, text="Cancel", width=12, command=on_cancel).pack(side=tk.RIGHT, padx=6)
+    ttk.Button(f_btns, text="OK", style="Primary.TButton", width=12, command=on_ok).pack(side=tk.RIGHT, padx=6)
+
+    win.wait_window()
+    return result[0]
+
+
+def ask_confirm_dialog(
+    title: str,
+    prompt: str,
+    parent: Optional[tk.Tk | tk.Toplevel] = None,
+) -> bool:
+    """
+    Spacious confirmation modal (Yes/No) that opens in at least 800x600 resolution
+    matching the application dark theme.
+    """
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.geometry("800x600")
+    win.minsize(800, 600)
+    win.configure(background="#1e1e24")
+    win.grab_set()
+
+    result = [False]
+
+    f_content = ttk.Frame(win)
+    f_content.pack(fill=tk.BOTH, expand=True, padx=40, pady=40)
+
+    ttk.Label(f_content, text=title, style="Title.TLabel").pack(anchor=tk.W, pady=(0, 16))
+
+    ttk.Label(
+        f_content,
+        text=prompt,
+        font=("Segoe UI", 11),
+        foreground="#e0e0e0",
+        wraplength=720,
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W, pady=(0, 24))
+
+    f_btns = ttk.Frame(f_content)
+    f_btns.pack(anchor=tk.E, pady=16)
+
+    def on_no():
+        result[0] = False
+        win.destroy()
+
+    def on_yes():
+        result[0] = True
+        win.destroy()
+
+    win.bind("<Escape>", lambda e: on_no())
+    win.bind("<Return>", lambda e: on_yes())
+
+    ttk.Button(f_btns, text="No", width=12, command=on_no).pack(side=tk.RIGHT, padx=6)
+    ttk.Button(f_btns, text="Yes", style="Primary.TButton", width=12, command=on_yes).pack(side=tk.RIGHT, padx=6)
+
+    win.wait_window()
+    return result[0]
+
 
 class AppUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Rotating-Host Minecraft P2P")
-        self.geometry("680x560")
-        self.minsize(580, 480)
+        self.title("Rotating-Host Minecraft P2P v1.2.0")
+        self.geometry("800x600")
+        self.minsize(800, 600)
+
 
         self.api_url = get_saved_api_url()
         self.world_dir = DEFAULT_WORLD_DIR
         self.log_queue = queue.Queue()
         self.host_thread: Optional[threading.Thread] = None
         self.is_hosting = False
+
+        # Clean up any legacy duplicate world folders (*_prev) from saves
+        try:
+            clean_world_duplicates(self.world_dir.parent)
+        except Exception:
+            pass
 
         self._apply_theme()
         self._build_widgets()
@@ -91,6 +218,9 @@ class AppUI(tk.Tk):
         style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"), foreground="#4cc9f0")
         style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"), foreground="#a0a0b0")
         style.configure("Status.TLabel", font=("Segoe UI", 10, "bold"), foreground="#06d6a0")
+        style.configure("Badge.TLabel", font=("Segoe UI", 9, "bold"), background="#2b2d42", foreground="#4cc9f0", padding=(6, 2))
+        style.configure("TLabelframe", background="#1e1e24", foreground="#a0a0b0", relief=tk.GROOVE)
+        style.configure("TLabelframe.Label", background="#1e1e24", foreground="#4cc9f0", font=("Segoe UI", 9, "bold"))
         style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6)
         style.configure("Primary.TButton", background="#4361ee", foreground="#ffffff")
         style.configure("Accent.TButton", background="#06d6a0", foreground="#000000")
@@ -116,7 +246,22 @@ class AppUI(tk.Tk):
             msg = self.log_queue.get_nowait()
             if hasattr(self, "log_text"):
                 self.log_text.configure(state=tk.NORMAL)
-                self.log_text.insert(tk.END, msg + "\n")
+                msg_lower = msg.lower()
+                tag = "normal"
+                if "error" in msg_lower or "failed" in msg_lower or "exception" in msg_lower or "⚠️" in msg:
+                    tag = "err"
+                elif "warn" in msg_lower or "declined" in msg_lower or "notice" in msg_lower:
+                    tag = "warn"
+                elif msg.startswith("[host]"):
+                    tag = "host"
+                elif msg.startswith("[guest]"):
+                    tag = "guest"
+                elif msg.startswith("[cleaner]") or msg.startswith("[tailnet]"):
+                    tag = "info"
+                elif "success" in msg_lower or "ready" in msg_lower or "🟢" in msg:
+                    tag = "guest"
+
+                self.log_text.insert(tk.END, msg + "\n", tag)
                 self.log_text.see(tk.END)
                 self.log_text.configure(state=tk.DISABLED)
         self.after(100, self._process_log_queue)
@@ -184,7 +329,7 @@ class AppUI(tk.Tk):
 
         # Server URL display & change option for custom self-hosted backends
         def on_change_server_url():
-            new_url = simpledialog.askstring(
+            new_url = ask_input_dialog(
                 "Custom Server URL",
                 "Enter your backend server API URL:\n(Leave default if using standard setup)",
                 initialvalue=self.api_url,
@@ -211,33 +356,48 @@ class AppUI(tk.Tk):
         """Allow the host/admin to enter their Server URL, Master Token, and Admin Secret directly in the UI."""
         dlg = tk.Toplevel(self)
         dlg.title("Host / Admin Configuration & Login")
-        dlg.geometry("520x330")
+        dlg.geometry("800x600")
+        dlg.minsize(800, 600)
         dlg.configure(background="#1e1e24")
+        dlg.grab_set()
 
-        ttk.Label(dlg, text="Admin Configuration & Sign In", style="Title.TLabel").pack(pady=(12, 4))
+        f_container = ttk.Frame(dlg)
+        f_container.pack(fill=tk.BOTH, expand=True, padx=40, pady=30)
+
+        ttk.Label(f_container, text="Admin Configuration & Sign In", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 8))
         ttk.Label(
-            dlg,
+            f_container,
             text="If hosting on your own server, enter your Render/custom API URL below.\n"
                  "Otherwise, leave default to use the standard backend.",
-            justify=tk.CENTER,
+            justify=tk.LEFT,
             foreground="#a0a0b0",
-        ).pack(pady=(0, 10))
+            font=("Segoe UI", 10),
+        ).pack(anchor=tk.W, pady=(0, 20))
 
-        f_inputs = ttk.Frame(dlg)
-        f_inputs.pack(pady=6, padx=16)
+        f_inputs = ttk.Frame(f_container)
+        f_inputs.pack(fill=tk.X, pady=6)
 
-        ttk.Label(f_inputs, text="Server API URL:").grid(row=0, column=0, sticky=tk.W, pady=6)
-        entry_url = ttk.Entry(f_inputs, width=32, font=("Segoe UI", 9))
+        ttk.Label(f_inputs, text="Server API URL:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky=tk.W, pady=10)
+        entry_url = ttk.Entry(f_inputs, font=("Segoe UI", 11))
         entry_url.insert(0, self.api_url)
-        entry_url.grid(row=0, column=1, pady=6, padx=8)
+        entry_url.grid(row=0, column=1, sticky=tk.EW, pady=10, padx=(16, 0))
 
-        ttk.Label(f_inputs, text="Master Token (PLAYER_TOKEN):").grid(row=1, column=0, sticky=tk.W, pady=6)
-        entry_tok = ttk.Entry(f_inputs, width=32, show="*", font=("Segoe UI", 9))
-        entry_tok.grid(row=1, column=1, pady=6, padx=8)
+        ttk.Label(f_inputs, text="Master Token (PLAYER_TOKEN):", font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky=tk.W, pady=10)
+        entry_tok = ttk.Entry(f_inputs, show="*", font=("Segoe UI", 11))
+        init_tok = get_api_token() or os.getenv("PLAYER_TOKEN") or ""
+        entry_tok.insert(0, init_tok)
+        entry_tok.grid(row=1, column=1, sticky=tk.EW, pady=10, padx=(16, 0))
 
-        ttk.Label(f_inputs, text="Admin Secret (ADMIN_SECRET):").grid(row=2, column=0, sticky=tk.W, pady=6)
-        entry_sec = ttk.Entry(f_inputs, width=32, show="*", font=("Segoe UI", 9))
-        entry_sec.grid(row=2, column=1, pady=6, padx=8)
+        ttk.Label(f_inputs, text="Admin Secret (ADMIN_SECRET):", font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky=tk.W, pady=10)
+        entry_sec = ttk.Entry(f_inputs, show="*", font=("Segoe UI", 11))
+        init_sec = get_admin_secret() or os.getenv("ADMIN_SECRET") or ""
+        entry_sec.insert(0, init_sec)
+        entry_sec.grid(row=2, column=1, sticky=tk.EW, pady=10, padx=(16, 0))
+
+        f_inputs.columnconfigure(1, weight=1)
+
+        lbl_status = ttk.Label(f_container, text="", font=("Segoe UI", 10), foreground="#4cc9f0")
+        lbl_status.pack(anchor=tk.W, pady=12)
 
         def do_login():
             url = entry_url.get().strip().rstrip("/")
@@ -251,21 +411,57 @@ class AppUI(tk.Tk):
                 messagebox.showwarning("Missing Token", "Please enter your PLAYER_TOKEN.", parent=dlg)
                 return
 
-            save_api_url(url)
-            self.api_url = url
-            save_api_token(tok)
-            if sec:
-                save_admin_secret(sec)
+            btn_submit.configure(state=tk.DISABLED)
+            lbl_status.configure(text="⏳ Connecting to server (may take 20s if waking up)...", foreground="#4cc9f0")
 
-            dlg.destroy()
-            messagebox.showinfo(
-                "Success",
-                f"Connected to server:\n{url}\n\nHost/Admin credentials saved!",
-                parent=self,
-            )
-            self.show_main()
+            def worker():
+                try:
+                    import requests as _req
+                    r = _req.get(f"{url}/lock/status", headers={"x-api-token": tok}, timeout=45)
+                    if r.status_code == 401:
+                        self.after(0, lambda: (
+                            lbl_status.configure(text="❌ Invalid PLAYER_TOKEN.", foreground="#ef476f"),
+                            btn_submit.configure(state=tk.NORMAL)
+                        ))
+                        return
+                    if r.status_code != 200:
+                        self.after(0, lambda: (
+                            lbl_status.configure(text=f"❌ Server returned status {r.status_code}.", foreground="#ef476f"),
+                            btn_submit.configure(state=tk.NORMAL)
+                        ))
+                        return
 
-        ttk.Button(dlg, text="Save & Sign In as Admin", style="Primary.TButton", command=do_login).pack(pady=16)
+                    save_api_url(url)
+                    self.api_url = url
+                    save_api_token(tok)
+                    if sec:
+                        save_admin_secret(sec)
+
+                    def on_success():
+                        dlg.destroy()
+                        messagebox.showinfo(
+                            "Success",
+                            f"Connected to server:\n{url}\n\nHost/Admin credentials verified and saved!",
+                            parent=self,
+                        )
+                        self.show_main()
+
+                    self.after(0, on_success)
+                except Exception as exc:
+                    self.after(0, lambda: (
+                        lbl_status.configure(text=f"❌ Connection error: {exc}", foreground="#ffb703"),
+                        btn_submit.configure(state=tk.NORMAL)
+                    ))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        f_actions = ttk.Frame(f_container)
+        f_actions.pack(anchor=tk.E, pady=(20, 0))
+
+        ttk.Button(f_actions, text="Cancel", width=12, command=dlg.destroy).pack(side=tk.RIGHT, padx=6)
+        btn_submit = ttk.Button(f_actions, text="Save & Sign In as Admin", style="Primary.TButton", command=do_login)
+        btn_submit.pack(side=tk.RIGHT, padx=6)
+
 
 
     def _on_submit_onboarding(self):
@@ -303,31 +499,37 @@ class AppUI(tk.Tk):
                     def show_invite_dialog():
                         dlg = tk.Toplevel(self)
                         dlg.title("Step 2 – Join Tailscale Network")
-                        dlg.geometry("520x220")
+                        dlg.geometry("800x600")
+                        dlg.minsize(800, 600)
                         dlg.configure(background="#1e1e24")
                         dlg.grab_set()
 
-                        ttk.Label(
-                            dlg,
-                            text="📧 Check your email OR click the link below:",
-                            style="Header.TLabel",
-                        ).pack(pady=(16, 6), padx=16)
+                        f_container = ttk.Frame(dlg)
+                        f_container.pack(fill=tk.BOTH, expand=True, padx=40, pady=40)
 
                         ttk.Label(
-                            dlg,
-                            text="A browser tab should have opened. If not, copy this link and open it manually:",
-                            style="TLabel",
-                            wraplength=480,
-                        ).pack(padx=16)
+                            f_container,
+                            text="📧 Check your email OR click the link below:",
+                            style="Title.TLabel",
+                        ).pack(anchor=tk.W, pady=(0, 16))
+
+                        ttk.Label(
+                            f_container,
+                            text="A browser tab should have opened. If not, copy this invite link and open it in your browser to join the shared Tailscale network:",
+                            font=("Segoe UI", 11),
+                            foreground="#e0e0e0",
+                            wraplength=720,
+                            justify=tk.LEFT,
+                        ).pack(anchor=tk.W, pady=(0, 20))
 
                         # Clickable / copyable URL entry
                         url_var = tk.StringVar(value=invite_url)
-                        entry_url = ttk.Entry(dlg, textvariable=url_var, font=("Segoe UI", 8), width=60)
-                        entry_url.pack(padx=16, pady=(8, 4))
+                        entry_url = ttk.Entry(f_container, textvariable=url_var, font=("Segoe UI", 11))
+                        entry_url.pack(fill=tk.X, pady=(0, 24))
                         entry_url.configure(state="readonly")
 
-                        f_btns = ttk.Frame(dlg)
-                        f_btns.pack(pady=8)
+                        f_btns = ttk.Frame(f_container)
+                        f_btns.pack(anchor=tk.W, pady=8)
 
                         def copy_link():
                             self.clipboard_clear()
@@ -340,7 +542,7 @@ class AppUI(tk.Tk):
                         btn_copy = ttk.Button(f_btns, text="📋 Copy Link", style="Primary.TButton", command=copy_link)
                         btn_copy.pack(side=tk.LEFT, padx=6)
                         ttk.Button(f_btns, text="🌐 Open in Browser", command=open_link).pack(side=tk.LEFT, padx=6)
-                        ttk.Button(f_btns, text="Done", command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+                        ttk.Button(f_btns, text="Done", width=12, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
                     self.after(0, show_invite_dialog)
 
@@ -371,11 +573,23 @@ class AppUI(tk.Tk):
         for w in self.frame_main.winfo_children():
             w.destroy()
 
-        # Top Bar: Title + Admin Gear
+        # Top Bar: Title + Player Identity + Admin Gear
         f_top = ttk.Frame(self.frame_main)
         f_top.pack(fill=tk.X, pady=(0, 10))
 
         ttk.Label(f_top, text="Minecraft P2P World Hub", style="Title.TLabel").pack(side=tk.LEFT)
+
+        try:
+            player_name, _ = detect_local_player_identity()
+            if player_name and player_name != "Player":
+                lbl_player = ttk.Label(
+                    f_top,
+                    text=f"👤 {player_name}",
+                    style="Badge.TLabel",
+                )
+                lbl_player.pack(side=tk.LEFT, padx=(12, 0))
+        except Exception:
+            pass
 
         btn_admin = ttk.Button(f_top, text="⚙ Admin", width=10, command=self.open_admin_panel)
         btn_admin.pack(side=tk.RIGHT, padx=4)
@@ -433,27 +647,29 @@ class AppUI(tk.Tk):
 
         update_tailscale_display()
 
-        # Live Host Status Banner — polls /lock/status every 30s
-        f_host_banner = ttk.Frame(self.frame_main)
-        f_host_banner.pack(fill=tk.X, pady=(2, 4))
+        # Live Host Status Card
+        card_host = ttk.LabelFrame(self.frame_main, text=" Live Game Status ")
+        card_host.pack(fill=tk.X, pady=(4, 8))
+
+        f_card_inner = ttk.Frame(card_host)
+        f_card_inner.pack(fill=tk.X, padx=10, pady=8)
 
         self.lbl_host_banner = ttk.Label(
-            f_host_banner,
+            f_card_inner,
             text="⏳ Checking who's hosting...",
-            font=("Segoe UI", 9, "italic"),
+            font=("Segoe UI", 10, "bold"),
             foreground="#a0a0b0",
-            background="#1e1e24",
         )
         self.lbl_host_banner.pack(side=tk.LEFT)
 
-        self.lbl_world_version = ttk.Label(
-            f_host_banner,
-            text="",
-            font=("Segoe UI", 8),
-            foreground="#606070",
-            background="#1e1e24",
-        )
-        self.lbl_world_version.pack(side=tk.RIGHT)
+        def _update_button_emphasis(is_live_host: bool):
+            if hasattr(self, "btn_join") and hasattr(self, "btn_host"):
+                if is_live_host:
+                    self.btn_join.configure(style="Accent.TButton", text="🚀 Join World (Host is Online!)")
+                    self.btn_host.configure(style="TButton", text="🎮 Host World")
+                else:
+                    self.btn_join.configure(style="TButton", text="🚀 Join World")
+                    self.btn_host.configure(style="Primary.TButton", text="🎮 Host World")
 
         def _poll_host_status():
             token = get_api_token()
@@ -474,25 +690,47 @@ class AppUI(tk.Tk):
                     world_ver = data.get("current_world_version")
 
                     if hosting and host_name:
-                        banner_text = f"🟢 {host_name} is hosting — click Join World to connect"
+                        banner_text = f"🟢 ONLINE: {host_name} is hosting — Click Join to play!"
                         banner_color = "#06d6a0"
                     elif lock_held and host_name:
-                        banner_text = f"🔵 {host_name} is setting up the host..."
+                        banner_text = f"🔵 STARTING: {host_name} is loading the world..."
                         banner_color = "#4cc9f0"
                     else:
-                        banner_text = "🔴 Nobody is hosting right now"
+                        banner_text = "🟡 READY: Nobody is currently hosting"
                         banner_color = "#ffb703"
 
                     ver_text = f"Cloud: {world_ver[:16]}…" if world_ver else "Cloud: No world yet"
                     self.after(0, lambda: self.lbl_host_banner.configure(text=banner_text, foreground=banner_color))
                     self.after(0, lambda: self.lbl_world_version.configure(text=ver_text))
+                    self.after(0, lambda: _update_button_emphasis(hosting and bool(host_name)))
             except Exception:
                 pass
             if self.frame_main.winfo_ismapped():
                 self.after(30000, _poll_host_status)
 
+        def _manual_refresh_host():
+            self.lbl_host_banner.configure(text="⏳ Refreshing status...", foreground="#a0a0b0")
+            threading.Thread(target=_poll_host_status, daemon=True).start()
+
+        btn_refresh_status = ttk.Button(
+            f_card_inner,
+            text="🔄 Refresh",
+            width=10,
+            command=_manual_refresh_host,
+        )
+        btn_refresh_status.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.lbl_world_version = ttk.Label(
+            f_card_inner,
+            text="",
+            font=("Segoe UI", 8),
+            foreground="#808090",
+        )
+        self.lbl_world_version.pack(side=tk.RIGHT, padx=4)
+
         # First poll after 1s, then every 30s
         self.after(1000, _poll_host_status)
+
 
         # World Selection Row
         f_world = ttk.Frame(self.frame_main)
@@ -614,7 +852,13 @@ class AppUI(tk.Tk):
                 except Exception as exc:
                     messagebox.showerror("Export Error", str(exc))
 
-        ttk.Button(f_log_header, text="💾 Export Log", command=export_log).pack(side=tk.RIGHT)
+        def clear_log():
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.delete("1.0", tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+
+        ttk.Button(f_log_header, text="💾 Export", width=9, command=export_log).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(f_log_header, text="🗑 Clear", width=8, command=clear_log).pack(side=tk.RIGHT)
 
         self.log_text = ScrolledText(
             self.frame_main,
@@ -622,9 +866,15 @@ class AppUI(tk.Tk):
             bg="#121216",
             fg="#e0e0e0",
             insertbackground="#ffffff",
-            font=("Consolas", 9),
+            font=("Consolas", 10),
             state=tk.DISABLED,
         )
+        self.log_text.tag_configure("normal", foreground="#e0e0e0")
+        self.log_text.tag_configure("host", foreground="#4cc9f0")
+        self.log_text.tag_configure("guest", foreground="#06d6a0")
+        self.log_text.tag_configure("warn", foreground="#ffb703")
+        self.log_text.tag_configure("err", foreground="#ef476f")
+        self.log_text.tag_configure("info", foreground="#a0c4ff")
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
 
         self.log(f"[app] Connected to API: {self.api_url}")
@@ -677,21 +927,21 @@ class AppUI(tk.Tk):
         self.lbl_hub_status.configure(text="Status: Hosting...", foreground="#4cc9f0")
 
         def ask_port_gui() -> Optional[int]:
-            import tkinter.simpledialog as sd
             res = [None]
             ev = threading.Event()
             def _prompt():
                 try:
-                    p = sd.askinteger(
+                    val = ask_input_dialog(
                         "LAN Port Entry",
                         "Could not detect Minecraft LAN broadcast automatically.\n\n"
                         "Please enter the port number displayed in your Minecraft chat\n"
                         "(e.g. 'Local game hosted on port 54321'):",
                         parent=self,
-                        minvalue=1024,
-                        maxvalue=65535,
                     )
-                    res[0] = p
+                    if val and val.strip().isdigit():
+                        p = int(val.strip())
+                        if 1024 <= p <= 65535:
+                            res[0] = p
                 except Exception:
                     pass
                 finally:
@@ -699,6 +949,38 @@ class AppUI(tk.Tk):
             self.after(0, _prompt)
             ev.wait()
             return res[0]
+
+        def ask_tailnet_confirm(current: str, expected: str) -> bool:
+            """
+            Called on the background thread; schedules a dialog on the main thread
+            and waits for the result.
+            """
+            result = [False]
+            ev = threading.Event()
+
+            def _show():
+                prompt_txt = (
+                    f"The app runs on a dedicated Minecraft network:\n"
+                    f"  ➜  {expected}\n\n"
+                    f"Your Tailscale is currently on:\n"
+                    f"  ➜  {current}\n\n"
+                    f"Switching is required to host or join.\n"
+                    f"Your network will be restored automatically when you finish.\n\n"
+                    f"⚠️  Any other Tailscale connections (e.g. work VPN) will be\n"
+                    f"temporarily interrupted during the session.\n\n"
+                    f"Switch networks and continue?"
+                )
+                answer = ask_confirm_dialog(
+                    "Network Switch Required",
+                    prompt_txt,
+                    parent=self,
+                )
+                result[0] = bool(answer)
+                ev.set()
+
+            self.after(0, _show)
+            ev.wait()
+            return result[0]
 
         def worker():
             try:
@@ -709,6 +991,7 @@ class AppUI(tk.Tk):
                     world_dir=self.world_dir,
                     log=self.log,
                     ask_port_fn=ask_port_gui,
+                    confirm_tailnet_switch_fn=ask_tailnet_confirm,
                 )
             except (Exception, SystemExit) as exc:
                 self.log(f"[host] Session ended: {exc}")
@@ -829,19 +1112,27 @@ class AppUI(tk.Tk):
     def open_admin_panel(self):
         secret = get_admin_secret()
         if not secret:
-            secret = simpledialog.askstring("Admin Secret", "Enter the server ADMIN_SECRET:", show="*")
+            secret = ask_input_dialog("Admin Secret", "Enter the server ADMIN_SECRET:", show="*", parent=self)
             if not secret:
                 return
-            save_admin_secret(secret)
+            save_admin_secret(secret.strip())
 
         token = get_api_token()
         if not token:
-            messagebox.showerror("Error", "Player API token is required.")
-            return
+            token = ask_input_dialog(
+                "Master Token Required",
+                "Enter your server PLAYER_TOKEN (from your Render dashboard):",
+                show="*",
+                parent=self,
+            )
+            if not token:
+                return
+            save_api_token(token.strip())
 
         admin_win = tk.Toplevel(self)
         admin_win.title("Admin Control Panel")
-        admin_win.geometry("620x620")
+        admin_win.geometry("800x600")
+        admin_win.minsize(800, 600)
         admin_win.configure(background="#1e1e24")
 
         admin_client = AdminClient(self.api_url, secret, token)
@@ -861,7 +1152,7 @@ class AppUI(tk.Tk):
         lbl_target_srv.pack(side=tk.LEFT)
 
         def change_admin_server_url():
-            new_url = simpledialog.askstring(
+            new_url = ask_input_dialog(
                 "Target Server API URL",
                 "Enter custom backend server API URL:\n(e.g. https://your-app.onrender.com)",
                 initialvalue=self.api_url,
@@ -875,12 +1166,44 @@ class AppUI(tk.Tk):
                 admin_client.api_url = clean
                 messagebox.showinfo("Server Updated", f"Target server updated to:\n{clean}", parent=admin_win)
                 refresh_lock_status()
+                refresh_players()
 
-        ttk.Button(f_target_srv, text="✏️ Change Server", command=change_admin_server_url).pack(side=tk.RIGHT)
+        def change_admin_credentials():
+            curr_sec = get_admin_secret() or ""
+            new_sec = ask_input_dialog(
+                "Admin Secret",
+                "Enter ADMIN_SECRET:",
+                show="*",
+                initialvalue=curr_sec,
+                parent=admin_win,
+            )
+            if new_sec and new_sec.strip():
+                save_admin_secret(new_sec.strip())
+                admin_client.admin_secret = new_sec.strip()
+
+            curr_tok = get_api_token() or ""
+            new_tok = ask_input_dialog(
+                "Master Player Token",
+                "Enter PLAYER_TOKEN (from your Render settings):",
+                show="*",
+                initialvalue=curr_tok,
+                parent=admin_win,
+            )
+            if new_tok and new_tok.strip():
+                save_api_token(new_tok.strip())
+                admin_client.api_token = new_tok.strip()
+
+            messagebox.showinfo("Credentials Updated", "Admin credentials updated! Refreshing...", parent=admin_win)
+            refresh_lock_status()
+            refresh_players()
+
+        ttk.Button(f_target_srv, text="✏️ Server", width=9, command=change_admin_server_url).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(f_target_srv, text="🔑 Credentials", width=13, command=change_admin_credentials).pack(side=tk.RIGHT, padx=2)
 
         # -------------------------------------------------------------
         # Lock Status — always visible at the top of admin panel
         # -------------------------------------------------------------
+
         lf_lock = ttk.LabelFrame(admin_win, text=" 🔒 Current Lock Status ")
         lf_lock.pack(fill=tk.X, padx=16, pady=(4, 6))
 
@@ -960,7 +1283,7 @@ class AppUI(tk.Tk):
                 messagebox.showerror("Error", f"World folder does not exist:\n{target_path}", parent=admin_win)
                 return
 
-            if messagebox.askyesno("Confirm Set World", f"Upload '{sel_lbl}' and make it the active cloud world for all players?", parent=admin_win):
+            if ask_confirm_dialog("Confirm Set World", f"Upload '{sel_lbl}' and make it the active cloud world for all players?", parent=admin_win):
                 try:
                     from client.world_sync import cmd_upload
                     # Force-release any stale lock before uploading so admin is never blocked
@@ -985,7 +1308,7 @@ class AppUI(tk.Tk):
         f_lock_btns.pack(fill=tk.X, padx=8, pady=(4, 2))
 
         def do_force_release_lock():
-            if messagebox.askyesno(
+            if ask_confirm_dialog(
                 "Force Release Lock",
                 "This will forcefully release the lock, even if someone is currently hosting.\n\n"
                 "Use this when a player's lock is stuck and blocking others.\n"
@@ -1002,7 +1325,7 @@ class AppUI(tk.Tk):
                     messagebox.showerror("Error", str(e), parent=admin_win)
 
         def do_cloud_clear():
-            if messagebox.askyesno(
+            if ask_confirm_dialog(
                 "⚠️ Clear ALL Cloud Data",
                 "This will DELETE ALL cloud world data from R2 storage and reset the lock.\n\n"
                 "• All cloud world backups will be permanently deleted.\n"
@@ -1029,7 +1352,7 @@ class AppUI(tk.Tk):
         ttk.Button(f_lock_btns, text="🧹 Clear Cloud Entirely", style="Danger.TButton", command=do_cloud_clear).pack(side=tk.LEFT)
 
         def do_reset_world():
-            if messagebox.askyesno(
+            if ask_confirm_dialog(
                 "Confirm Delete / Reset",
                 "Are you sure you want to DELETE the cloud world?\n\n"
                 "This will wipe all cloud backups and reset the server to 'fresh world' state.\n"
@@ -1105,7 +1428,15 @@ class AppUI(tk.Tk):
                     list_box.insert(tk.END, line)
                     player_map[idx] = p["id"]
             except Exception as e:
-                lbl_slots.configure(text=f"Error loading players: {e}")
+                err_str = str(e)
+                if "401" in err_str or "403" in err_str:
+                    lbl_slots.configure(
+                        text="⚠️ Authentication failed: Invalid ADMIN_SECRET or PLAYER_TOKEN. Click '🔑 Credentials' above.",
+                        foreground="#ef476f",
+                    )
+                else:
+                    lbl_slots.configure(text=f"Error loading players: {e}", foreground="#ffb703")
+
 
         def revoke_selected():
             sel = list_box.curselection()
@@ -1113,7 +1444,7 @@ class AppUI(tk.Tk):
                 messagebox.showwarning("Select Player", "Please select a player to revoke.", parent=admin_win)
                 return
             p_id = player_map.get(sel[0])
-            if messagebox.askyesno("Confirm Revoke", f"Are you sure you want to revoke player {p_id}?", parent=admin_win):
+            if ask_confirm_dialog("Confirm Revoke", f"Are you sure you want to revoke player {p_id}?", parent=admin_win):
                 try:
                     admin_client.revoke_player(p_id)
                     messagebox.showinfo("Success", f"Player {p_id} has been revoked.", parent=admin_win)
@@ -1133,9 +1464,20 @@ class AppUI(tk.Tk):
 
 
 def main():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                import ctypes
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
     app = AppUI()
     app.mainloop()
 
 
 if __name__ == "__main__":
     main()
+

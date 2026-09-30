@@ -8,10 +8,11 @@ block_cipher = None
 
 a = Analysis(
     ['main.py'],
-    pathex=['.'],
+    pathex=['.', 'client'],
     binaries=[],
     datas=[],
     hiddenimports=[
+        'dotenv',
         'keyring',
         'keyring.backends',
         'keyring.backends.Windows',
@@ -30,6 +31,7 @@ a = Analysis(
         'client.host_session',
         'client.lan_sniffer',
         'client.modpack_manager',
+        'client.player_sync',
         'client.world_sync',
     ],
     hookspath=[],

@@ -149,3 +149,13 @@ class APIClient:
         )
         r.raise_for_status()
         return r.json()
+
+    def get_tailnet_info(self) -> dict:
+        """Fetch the expected tailnet name/domain from the server."""
+        try:
+            r = self._request("GET", "/tailnet-info")
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return {"tailnet_name": ""}

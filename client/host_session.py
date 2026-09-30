@@ -127,6 +127,17 @@ def run_host_session(
         log("[host] No session token found after download. Aborting.")
         raise RuntimeError("No session token found after download. Aborting.")
 
+    # ── 2a. Start heartbeat immediately to protect the lock ───────────────
+    # The server lock has a 90s TTL. Minecraft launching, mod loading, and
+    # opening to LAN can easily take 2-3 minutes. Starting the heartbeat
+    # immediately ensures the lease is renewed continuously and never expires.
+    hb = HeartbeatThread(
+        heartbeat_fn=api.heartbeat,
+        owner_token=owner_token,
+        on_lock_lost=on_lock_lost,
+    )
+    hb.start()
+
     # ── 2b. Prepare world playerdata for host ────────────────────────────
     # In Singleplayer, Minecraft loads the host from level.dat (Data.Player).
     # We detect the local host's identity, preserve any previous host's items,
@@ -155,6 +166,7 @@ def run_host_session(
         log(f"[host] Minecraft detected (PID {mc_proc.pid}).")
     except TimeoutError as exc:
         log(f"[host] {exc}")
+        hb.stop()
         raise RuntimeError(str(exc))
 
     # ── 5.  Sniff LAN port ────────────────────────────────────────────────
@@ -174,15 +186,13 @@ def run_host_session(
 
     if port is None or not (1 <= port <= 65535):
         log("[host] No valid LAN port available. Aborting.")
+        hb.stop()
         raise RuntimeError("LAN port sniffing timed out and no valid port was provided.")
     log(f"[host] LAN port: {port}")
 
     # ── 6.  Post host address ─────────────────────────────────────────────
     # Fetch the expected tailnet name from the server so we pick the IP
     # that belongs to the shared app tailnet (not the host's personal tailnet).
-    # This fixes the case where a guest-turned-host has multiple Tailscale IPs
-    # (one from their own tailnet, one from the shared tailnet) and psutil/CLI
-    # would non-deterministically return the wrong one.
     expected_tailnet: Optional[str] = None
     try:
         tailnet_info = api.get_tailnet_info()
@@ -199,17 +209,10 @@ def run_host_session(
     try:
         api.set_host_address(owner_token, ts_ip, port)
         log(f"[host] Host address posted: {ts_ip}:{port}")
-    except APIError as exc:
+    except Exception as exc:
         log(f"[host] Warning – could not post host address: {exc}")
 
-    # ── 7.  Start heartbeat & autosave ────────────────────────────────────
-    hb = HeartbeatThread(
-        heartbeat_fn=api.heartbeat,
-        owner_token=owner_token,
-        on_lock_lost=on_lock_lost,
-    )
-    hb.start()
-
+    # ── 7.  Start autosave thread ─────────────────────────────────────────
     def do_autosave() -> None:
         if not lock_lost:
             try:

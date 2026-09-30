@@ -160,3 +160,89 @@ def test_finalize_world_after_host_mirrors_to_playerdata():
         pd_loaded = nbtlib.load(str(pd_file))
         assert extract_player_uuid_from_compound(pd_loaded) == host_uuid
         assert pd_loaded["Score"] == 9999
+
+
+def test_26_1_2_singleplayer_uuid_and_dual_uuid_sync():
+    from client.player_sync import sync_player_pair
+
+    with tempfile.TemporaryDirectory() as tmp:
+        world_dir = Path(tmp) / "OurWorld"
+        world_dir.mkdir(parents=True)
+        players_data = world_dir / "players" / "data"
+        players_adv = world_dir / "players" / "advancements"
+        players_stats = world_dir / "players" / "stats"
+        players_data.mkdir(parents=True)
+        players_adv.mkdir(parents=True)
+        players_stats.mkdir(parents=True)
+
+        host_id = "34208dac-aa74-42d4-aa9e-87bd7718d849"
+        guest_id = "d1ae6bd2-27f0-387f-998f-1bb2b35f9dfa"
+        new_host_id = "ad385985-99b9-4e6d-9046-a4f8e09319a5"
+
+        # Mock 26.1.2 level.dat with singleplayer_uuid
+        ints = uuid_to_ints(host_id)
+        level_nbt = nbtlib.File({
+            "Data": Compound({
+                "LevelName": String("OurWorld"),
+                "singleplayer_uuid": IntArray([Int(x) for x in ints]),
+            })
+        })
+        level_nbt.save(str(world_dir / "level.dat"), gzipped=True)
+
+        # Create host player data
+        h_pd = nbtlib.File({
+            "UUID": IntArray([Int(x) for x in ints]),
+            "Score": Int(777),
+        })
+        h_pd.save(str(players_data / f"{host_id}.dat"), gzipped=True)
+        (players_adv / f"{host_id}.json").write_text('{"adv": true}', encoding="utf-8")
+        (players_stats / f"{host_id}.json").write_text('{"stats": 1}', encoding="utf-8")
+
+        # Test sync_player_pair copies host -> guest
+        sync_player_pair(world_dir, host_id, guest_id)
+        assert (players_data / f"{guest_id}.dat").exists()
+        assert (players_adv / f"{guest_id}.json").exists()
+        assert (players_stats / f"{guest_id}.json").exists()
+
+        guest_loaded = nbtlib.load(str(players_data / f"{guest_id}.dat"))
+        assert extract_player_uuid_from_compound(guest_loaded) == guest_id
+
+        # Test prepare_world_for_host updates singleplayer_uuid for new host
+        prepare_world_for_host(world_dir, new_host_id)
+        updated_level = nbtlib.load(str(world_dir / "level.dat"))
+        assert extract_player_uuid_from_compound({"UUID": updated_level["Data"]["singleplayer_uuid"]}) == new_host_id
+
+
+def test_shared_identity_registry():
+    from client.player_sync import load_identity_registry, register_player_identity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        world_dir = Path(tmp) / "OurWorld"
+        world_dir.mkdir()
+
+        # Register player 1
+        register_player_identity(
+            world_dir,
+            "PlayerOne",
+            "34208dac-aa74-42d4-aa9e-87bd7718d849",
+            "d1ae6bd2-27f0-387f-998f-1bb2b35f9dfa",
+        )
+
+        reg = load_identity_registry(world_dir)
+        assert "PlayerOne" in reg
+        assert reg["PlayerOne"]["host_uuid"] == "34208dac-aa74-42d4-aa9e-87bd7718d849"
+        assert reg["PlayerOne"]["guest_uuid"] == "d1ae6bd2-27f0-387f-998f-1bb2b35f9dfa"
+
+        # Register player 2
+        register_player_identity(
+            world_dir,
+            "PlayerTwo",
+            "ad385985-99b9-4e6d-9046-a4f8e09319a5",
+            "5897a92d-648c-368b-94ec-f619ce17eb2c",
+        )
+
+        reg2 = load_identity_registry(world_dir)
+        assert len(reg2) == 2
+        assert "PlayerTwo" in reg2
+
+

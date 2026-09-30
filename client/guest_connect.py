@@ -111,6 +111,9 @@ def write_server_entry(servers_dat: Path, ip: str, port: int) -> None:
 # ------------------------------------------------------------------
 
 
+from client.modpack_manager import get_modpack_servers_dat_candidates
+
+
 def cmd_join(
     api_url: str,
     token: str,
@@ -121,8 +124,9 @@ def cmd_join(
     Full guest join flow.
 
     1. Fetch /host from the API.
-    2. Write the server entry into servers.dat.
-    3. Print instructions.
+    2. Write the server entry into all detected servers.dat files.
+    3. Copy the address to the clipboard for instant Direct Connect if game is open.
+    4. Print clear instructions.
 
     Accepts an optional `servers_dat` path override (used in tests).
     """
@@ -146,22 +150,37 @@ def cmd_join(
 
     log(f"[guest] {host_name} is hosting at {address}")
 
-    # Try to auto-write servers.dat
-    dat_path = servers_dat or find_servers_dat()
-
-    if dat_path is None:
-        log("[guest] Could not find Minecraft folder. Add the server manually:")
-        log(f"         Address: {address}")
-        return
-
+    # Auto-copy to clipboard so user can instantly Direct Connect -> Ctrl+V if Minecraft is already open
     try:
-        write_server_entry(dat_path, ip, port)
-        log(f"[guest] Server entry written to {dat_path}")
-        log("[guest] Open Minecraft → Multiplayer → look for 'OurWorld (P2P)' at the top.")
-        log("[guest] (If Minecraft is already open, close and reopen it first.)")
-    except Exception as exc:
-        log(f"[guest] Could not write servers.dat ({exc}).")
-        log(f"[guest] Add the server manually → Address: {address}")
+        import tkinter as tk
+        r = tk.Tk()
+        r.withdraw()
+        r.clipboard_clear()
+        r.clipboard_append(address)
+        r.update()
+        r.destroy()
+        log(f"[guest] 📋 Address {address} copied to clipboard!")
+    except Exception:
+        pass
+
+    # Try to auto-write all detected servers.dat files
+    targets = [servers_dat] if servers_dat else get_modpack_servers_dat_candidates()
+    written_count = 0
+    for dat_path in targets:
+        try:
+            write_server_entry(dat_path, ip, port)
+            written_count += 1
+        except Exception:
+            pass
+
+    if written_count > 0:
+        log(f"[guest] Updated 'OurWorld (P2P)' in {written_count} server list(s).")
+        log("[guest] In Minecraft Multiplayer:")
+        log("[guest] ➜ Click 'OurWorld (P2P)' at the top of your list to join!")
+        log("[guest] ➜ Or click 'Direct Connection' and press Ctrl+V (already copied!).")
+    else:
+        log(f"[guest] Address copied to clipboard: {address}")
+        log("[guest] In Minecraft: Click Multiplayer ➔ Direct Connection ➔ Ctrl+V to join!")
 
 
 # ------------------------------------------------------------------

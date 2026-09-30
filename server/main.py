@@ -744,12 +744,22 @@ def player_join(request: Request, body: JoinRequest):
             detail="Tailnet capacity reached (maximum 6 players)",
         )
 
+    # If a player with the same email already exists and was active, revoke the old duplicate
+    for old_id, old_player in list(_players_registry.items()):
+        if old_player.email.lower() == body.email.strip().lower() and not old_player.revoked:
+            old_player.revoked = True
+
     invite.uses_left -= 1
 
     ts_client = tailscale_mod.get_tailscale_client()
-    ts_invite = ts_client.create_user_invite(body.email.strip())
-    invite_id = ts_invite.get("id")
-    invite_url = ts_invite.get("inviteUrl")
+    try:
+        ts_invite = ts_client.create_user_invite(body.email.strip())
+        invite_id = ts_invite.get("id") if isinstance(ts_invite, dict) else None
+        invite_url = ts_invite.get("inviteUrl") if isinstance(ts_invite, dict) else None
+    except Exception as exc:
+        logger.error(f"[join] Tailscale invite creation error: {exc}")
+        invite_id = None
+        invite_url = None
 
     raw_token = secrets.token_urlsafe(32)
     token_h = _hash(raw_token)

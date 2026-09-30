@@ -92,10 +92,25 @@ class TailscaleClient:
             }
 
         url = f"{self.api_base}/api/v2/tailnet/{self.tailnet}/user-invites"
-        payload = {"email": email, "role": role}
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        payload = [{"email": email, "role": role}]
+        try:
+            resp = requests.post(url, headers=self._headers(), json=payload, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data[0]
+            if isinstance(data, dict):
+                return data
+            return {"id": None, "inviteUrl": None, "email": email}
+        except Exception as exc:
+            import logging
+            logging.getLogger("minecraft_p2p").error(f"[tailscale] Failed to create invite for {email}: {exc}")
+            return {
+                "id": None,
+                "inviteUrl": None,
+                "email": email,
+                "error": str(exc),
+            }
 
     def get_users(self) -> list[dict[str, Any]]:
         """List all users in the tailnet."""
